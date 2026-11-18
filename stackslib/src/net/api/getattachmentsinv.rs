@@ -31,7 +31,7 @@ use crate::net::httpcore::{RPCRequestHandler, StacksHttpRequest, StacksHttpRespo
 use crate::net::semantic::AttachmentSyncService;
 use crate::net::{Error as NetError, StacksNodeState};
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RPCGetAttachmentsInvRequestHandler {
     pub index_block_hash: Option<StacksBlockId>,
     pub page_indexes: Option<Vec<u32>>,
@@ -162,15 +162,13 @@ impl RPCRequestHandler for RPCGetAttachmentsInvRequestHandler {
             );
             warn!("{msg}");
             return StacksHttpResponse::new_error(&preamble, &HttpBadRequest::new(msg))
-                .try_into_contents()
-                .map_err(NetError::from);
+                .try_into_contents();
         }
         if page_indexes.is_empty() {
             let msg = "Page indexes missing".to_string();
             warn!("{msg}");
             return StacksHttpResponse::new_error(&preamble, &HttpBadRequest::new(msg))
-                .try_into_contents()
-                .map_err(NetError::from);
+                .try_into_contents();
         }
 
         let pages = node.with_node_state(|network, _sortdb, _chainstate, _mempool, _rpc_args| {
@@ -187,8 +185,7 @@ impl RPCRequestHandler for RPCGetAttachmentsInvRequestHandler {
             Err(msg) => {
                 warn!("{msg}");
                 return StacksHttpResponse::new_error(&preamble, &HttpNotFound::new(msg))
-                    .try_into_contents()
-                    .map_err(NetError::from);
+                    .try_into_contents();
             }
         };
 
@@ -211,7 +208,7 @@ impl HttpResponse for RPCGetAttachmentsInvRequestHandler {
         body: &[u8],
     ) -> Result<HttpResponsePayload, Error> {
         let pages: GetAttachmentsInvResponse = parse_json(preamble, body)?;
-        Ok(HttpResponsePayload::try_from_json(pages)?)
+        HttpResponsePayload::try_from_json(pages)
     }
 }
 

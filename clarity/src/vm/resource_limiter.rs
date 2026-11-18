@@ -48,6 +48,7 @@ impl TimeTracker {
     ///
     /// If `None` is provided, no time tracking is performed and the tracker
     /// behaves as an unlimited timer.
+    #[cfg(test)]
     pub fn from_opt_max_duration(duration: Option<Duration>) -> Self {
         match duration {
             Some(max_duration) => Self::from_max_duration(max_duration),
@@ -118,7 +119,7 @@ impl MemoryTracker {
     pub fn from_max_allocation(limit_bytes: u64) -> Self {
         if !tracking_allocator_installed() {
             error!(
-                "TrackingAllocator is not installed as the global allocator; any miner or signer configured memory limits will never trigger"
+                "TrackingAllocator is not installed as the global allocator; any configured memory limits will never trigger"
             );
         }
 
@@ -147,6 +148,35 @@ impl MemoryTracker {
             }
         }
     }
+
+    /// Reject an upcoming allocation of `bytes` that would exceed the limit,
+    /// so a known size can be refused before it is allocated.
+    pub fn check_can_allocate(&self, bytes: u64) -> Result<(), String> {
+        match self {
+            NoTracking => Ok(()),
+            MaxAllocated {
+                baseline,
+                limit_bytes,
+            } => {
+                let allocated = thread_allocated().net_allocated(baseline);
+                if allocated.saturating_add(bytes) > *limit_bytes {
+                    Err(format!(
+                        "Net memory allocation of {allocated} bytes plus {bytes} upcoming bytes exceeds budget of {limit_bytes} bytes."
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Net bytes allocated since the baseline. `None` for `NoTracking`.
+    pub fn net_allocated_bytes(&self) -> Option<u64> {
+        match self {
+            Self::NoTracking => None,
+            Self::MaxAllocated { baseline, .. } => Some(thread_allocated().net_allocated(baseline)),
+        }
+    }
 }
 
 /// Specifies the maximum wallclock time and the maximum heap allocation
@@ -168,23 +198,19 @@ impl MemoryTracker {
 ///
 /// During consensus-critical work, the budget MUST be [`ResourceBudget::unlimited`]
 /// to ensure determinism.
+#[derive(Debug, Clone, Copy)]
 pub struct ResourceBudget {
     max_duration: Option<Duration>,
     max_allocated_bytes: Option<u64>,
 }
 
 impl ResourceBudget {
-    pub fn new() -> Self {
+    /// Creates a new instance with no configured budgets.
+    pub fn unlimited() -> Self {
         Self {
             max_duration: None,
             max_allocated_bytes: None,
         }
-    }
-
-    pub fn unlimited() -> Self {
-        // identical to Self::new(), but also provided under the name `unlimited`
-        // to make intentions obvious at the call site
-        Self::new()
     }
 
     pub fn with_max_duration(mut self, duration: Option<Duration>) -> Self {
@@ -201,12 +227,6 @@ impl ResourceBudget {
     /// is not exceeded (relative to the baseline that is taken at call time).
     pub fn start_tracking(&self) -> ResourceLimiter {
         ResourceLimiter::from_budget(self)
-    }
-}
-
-impl Default for ResourceBudget {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -256,6 +276,19 @@ impl ResourceLimiter {
         self.mem_tracker
             .check_not_exceeded()
             .map_err(ResourceLimitExceeded::MaxAllocationExceeded)
+    }
+
+    /// Reject an upcoming allocation of `bytes` that would exceed the memory
+    /// limit. Prospective, unlike [`Self::check_not_exceeded`].
+    pub fn check_can_allocate(&self, bytes: u64) -> Result<(), ResourceLimitExceeded> {
+        self.mem_tracker
+            .check_can_allocate(bytes)
+            .map_err(ResourceLimitExceeded::MaxAllocationExceeded)
+    }
+
+    /// Net bytes allocated since the baseline. `None` if memory is untracked.
+    pub fn net_allocated_bytes(&self) -> Option<u64> {
+        self.mem_tracker.net_allocated_bytes()
     }
 }
 

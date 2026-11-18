@@ -40,36 +40,7 @@
         inherit (pkgs) lib;
 
         toolchain = pkgs.rust-bin.fromRustupToolchainFile ../../rust-toolchain.toml;
-        craneLib = ((crane.mkLib pkgs).overrideToolchain toolchain).overrideScope (
-          final: prev: {
-            downloadCargoPackageFromGit =
-              args:
-              let
-                drv = prev.downloadCargoPackageFromGit args;
-                # The pinned stacks-core git dep at this rev has readme = "README.md"
-                # in stackslib/Cargo.toml but the file doesn't exist. Rust 1.94+
-                # errors on `cargo package -l` for missing readmes.
-                # TODO: remove this override when the pinned dep moves to a revision which no longer
-                # has invalid 'readme' keys.
-                needsPatch =
-                  args.git == "https://github.com/stacks-network/stacks-core.git"
-                  && args.rev == "ecaaf5c4d397a691e5155eef01b59ddfeaba4ddd";
-              in
-              if needsPatch then
-                drv.overrideAttrs (old: {
-                  preInstall = (old.preInstall or "") + ''
-                    find . -name Cargo.toml | while read -r toml; do
-                      readme=$(sed -n 's/^readme *= *"\(.*\)"/\1/p' "$toml")
-                      if [ -n "$readme" ] && [ ! -f "$(dirname "$toml")/$readme" ]; then
-                        touch "$(dirname "$toml")/$readme"
-                      fi
-                    done
-                  '';
-                })
-              else
-                drv;
-          }
-        );
+        craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
 
         name = "stacks-core";
 
@@ -77,8 +48,7 @@
         # Keep the source fileset in sync with Cargo's workspace declarations.
         workspaceCrates = map (crate: ../.. + "/${crate}") cargoWorkspace.members;
 
-        versions = builtins.fromTOML (builtins.readFile ../../versions.toml);
-        version = versions.stacks_node_version;
+        version = cargoWorkspace.package.version;
 
         # Common arguments can be set here to avoid repeating them later
         commonArgs = {
@@ -116,8 +86,6 @@
               [
                 ../../Cargo.toml
                 ../../Cargo.lock
-                #
-                ../../versions.toml
                 #
                 ../../stx-genesis/name_zonefiles.txt
                 ../../stx-genesis/name_zonefiles.txt.sha256

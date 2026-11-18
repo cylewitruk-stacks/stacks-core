@@ -23,8 +23,8 @@ use clarity::vm::types::{AssetIdentifier, BuffData, QualifiedContractIdentifier,
 use clarity::vm::{ClarityName, ClarityVersion, ContractContext};
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::StacksEpochId;
+use stacks_marf::ClarityMarfTrieId;
 
-use crate::chainstate::stacks::index::ClarityMarfTrieId;
 use crate::chainstate::stacks::StacksBlockHeader;
 use crate::clarity_vm::clarity::{ClarityInstance, ClarityMarfStore};
 use crate::clarity_vm::database::marf::MarfedKV;
@@ -109,7 +109,7 @@ fn helper_execute_epoch(
     owned_env.stx_faucet(&sender, 10);
 
     let (value, _, events) = owned_env
-        .execute_transaction(sender, None, contract_id, method, &[])
+        .execute_transaction(sender, None, contract_id, method, vec![])
         .unwrap();
     (value, events)
 }

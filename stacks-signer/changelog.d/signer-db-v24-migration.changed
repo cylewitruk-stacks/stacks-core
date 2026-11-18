@@ -1,0 +1,1 @@
+Signer database schema 24 combines upstream migrations with the native signer journal and removes legacy `stackerdb_tracking`. Existing upstream databases and prototype schema 20–22 databases upgrade forward while retaining native journal and sequence state.

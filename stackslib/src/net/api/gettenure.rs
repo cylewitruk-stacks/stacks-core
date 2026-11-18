@@ -15,7 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use regex::{Captures, Regex};
-use stacks_common::codec::{StacksMessageCodec, MAX_PAYLOAD_LEN};
+use stacks_common::codec::{StacksMessageCodec, MAX_MESSAGE_LEN, MAX_PAYLOAD_LEN};
 use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId};
 use stacks_common::types::net::PeerHost;
 
@@ -32,12 +32,12 @@ use crate::net::httpcore::{RPCRequestHandler, StacksHttpRequest, StacksHttpRespo
 use crate::net::{Error as NetError, StacksNodeState};
 use crate::util_lib::db::DBConn;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RPCNakamotoTenureRequestHandler {
     /// Block to start streaming from. It and its ancestors will be incrementally streamed until one of
     /// hte following happens:
     /// * we reach the first block in the tenure
-    /// * we would exceed MAX_PAYLOAD_LEN bytes transmitted if we started sending the next block
+    /// * we would exceed `max_tenure_response_bytes()` if we started sending the next block
     pub block_id: Option<StacksBlockId>,
     /// What's the final block ID to stream from?
     /// Passed as `stop=` query parameter
@@ -51,6 +51,23 @@ impl RPCNakamotoTenureRequestHandler {
             last_block_id: None,
         }
     }
+}
+
+/// The most block bytes that one `/v3/tenures` response may carry.
+///
+/// The response is chunk-encoded, and a client buffers at most `MAX_MESSAGE_LEN` bytes of the
+/// encoded body, chunk framing included. A response of up to `MAX_PAYLOAD_LEN` block bytes can
+/// exceed that, and such a client can then never read it. So leave room for the framing added
+/// when the body is sent in chunks of `chunk_size` bytes.
+pub fn max_tenure_response_bytes(chunk_size: u64) -> u64 {
+    // Each chunk adds its length in hex and two CRLFs; the body ends with `0\r\n\r\n`.
+    let chunk_framing = format!("{chunk_size:x}").len() as u64 + 4;
+    let max_encoded_body = u64::from(MAX_MESSAGE_LEN) - 5;
+    // `n` bytes are sent in at most `n / chunk_size + 1` chunks, so the encoded body is at most
+    // `n + (n / chunk_size + 1) * chunk_framing` bytes.
+    let max_bytes =
+        max_encoded_body.saturating_sub(chunk_framing) * chunk_size / (chunk_size + chunk_framing);
+    max_bytes.min(u64::from(MAX_PAYLOAD_LEN))
 }
 
 pub struct NakamotoTenureStream {
@@ -123,7 +140,8 @@ impl NakamotoTenureStream {
         self.total_sent = self
             .total_sent
             .saturating_add(self.block_stream.total_bytes);
-        if self.total_sent.saturating_add(parent_size) > u64::from(MAX_PAYLOAD_LEN) {
+        let max_bytes = max_tenure_response_bytes(self.hint_chunk_size() as u64);
+        if self.total_sent.saturating_add(parent_size) > max_bytes {
             // out of space to send this
             return Ok(false);
         }
@@ -239,15 +257,13 @@ impl RPCRequestHandler for RPCNakamotoTenureRequestHandler {
                     &HttpNotFound::new(format!("No such block {block_id:?}\n")),
                 )
                 .try_into_contents()
-                .map_err(NetError::from)
             }
             Err(e) => {
                 // nope -- error trying to check
                 let msg = format!("Failed to load block {block_id}: {e:?}\n");
                 warn!("{msg}");
                 return StacksHttpResponse::new_error(&preamble, &HttpServerError::new(msg))
-                    .try_into_contents()
-                    .map_err(NetError::from);
+                    .try_into_contents();
             }
         };
 

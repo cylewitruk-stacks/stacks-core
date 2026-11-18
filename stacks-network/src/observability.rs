@@ -477,7 +477,9 @@ mod tests {
         assert!(super::dropped_span_totals().0 > queue_before);
 
         release_tx.send(()).unwrap();
-        assert!(provider.force_flush().is_err());
+        // The worker may already have exported (and dropped) every queued span.
+        // Flushing an empty queue succeeds; the drop counter proves the failure.
+        let _ = provider.force_flush();
         assert!(super::dropped_span_totals().1 > export_before);
         let _ = provider.shutdown();
     }

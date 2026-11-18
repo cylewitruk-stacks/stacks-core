@@ -301,7 +301,7 @@ mod tests {
         let native_event = AuthenticatedSignerEvent {
             message: message.clone(),
             authentication: SignerEventAuthentication::Native {
-                envelope: SignerEnvelope {
+                envelope: Box::new(SignerEnvelope {
                     body: Some(SignerEnvelopeBody {
                         version: 1,
                         chain_id: 1,
@@ -317,7 +317,7 @@ mod tests {
                         proposal_manifest: None,
                     }),
                     signature: vec![0; 65],
-                },
+                }),
                 envelope_id: ContentId::from_domain_bytes(b"native-event", &message.payload),
             },
             origin: SignerIngressOrigin::Libp2p,

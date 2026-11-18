@@ -99,8 +99,9 @@ macro_rules! define_named_enum {
                 }
             }
 
-            /// Gets the name of the enum variant as a static string slice.
-            pub fn get_name_str(&self) -> &'static str {
+            /// Gets the name of the enum variant as a static string slice. `const` so that
+            /// constants can be defined from it.
+            pub const fn get_name_str(&self) -> &'static str {
                 match self {
                     $(
                         $Name::$Variant => $VarName,
@@ -820,6 +821,9 @@ mod tests {
             Variant2("variant2"),
         });
 
+        assert_eq!(MyEnum::ALL, &[MyEnum::Variant1, MyEnum::Variant2]);
+        assert_eq!(MyEnum::ALL_NAMES, &["variant1", "variant2"]);
+
         assert_eq!("variant1", MyEnum::Variant1.get_name());
         assert_eq!("variant2", MyEnum::Variant2.get_name());
 
@@ -841,6 +845,9 @@ mod tests {
             /// Variant2 doc
             Variant2("variant2"),
         });
+
+        assert_eq!(MyEnum::ALL, &[MyEnum::Variant1, MyEnum::Variant2]);
+        assert_eq!(MyEnum::ALL_NAMES, &["variant1", "variant2"]);
 
         assert_eq!("variant1", MyEnum::Variant1.get_name());
         assert_eq!("variant2", MyEnum::Variant2.get_name());

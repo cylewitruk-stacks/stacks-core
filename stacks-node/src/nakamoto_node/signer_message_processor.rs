@@ -22,10 +22,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use libsigner::v0::messages::{
-    BlockResponse, MessageSlotID, RejectCode, SignerMessage as SignerMessageV0,
+    BlockRejection, BlockResponse, MessageSlotID, RejectCode, SignerMessage as SignerMessageV0,
+    StateMachineUpdate,
 };
 use libsigner::v0::signer_state::{GlobalStateEvaluator, SignerStateMachine};
-use libsigner::{SignerEntries, SignerEvent, SignerSession, StackerDBSession};
+use libsigner::{SignerEntries, SignerEvent};
 use stacks::burnchains::{Burnchain, Txid};
 use stacks::chainstate::burn::BlockSnapshot;
 use stacks::chainstate::nakamoto::NakamotoBlockHeader;
@@ -34,6 +35,7 @@ use stacks::chainstate::stacks::events::StackerDBChunksEvent;
 use stacks::chainstate::stacks::Error as ChainstateError;
 use stacks::codec::StacksMessageCodec;
 use stacks::net::api::postblock_proposal::ValidateRejectCode;
+use stacks::net::stackerdb::StackerDBs;
 use stacks::types::chainstate::{StacksAddress, StacksPublicKey};
 use stacks::types::PublicKey;
 use stacks::util::get_epoch_time_secs;
@@ -80,6 +82,8 @@ pub struct BlockStatus {
     pub total_weight_approved: u32,
     /// Total weight of signers who have rejected the block
     pub total_weight_rejected: u32,
+    /// Rejection weight attributable to reasons reconsidered on re-proposal.
+    pub total_weight_rejected_transient: u32,
     /// Signer weight that explicitly could not evaluate this proposal. This
     /// carries no rejection weight and may later be replaced by a real vote.
     pub total_weight_unavailable: u32,
@@ -93,6 +97,49 @@ pub struct BlockStatus {
 pub(super) struct TimestampInfo {
     pub timestamp: u64,
     pub weight: u32,
+}
+
+/// Loads initial legacy signer state from the local replicated chunk store.
+pub struct InitialChunksLoader<'a> {
+    /// Reward cycle whose state is loaded.
+    reward_cycle_id: u64,
+    /// Number of registered signer slots.
+    signer_count: u32,
+    /// Local replicated chunk store.
+    stacker_dbs: &'a StackerDBs,
+}
+
+impl<'a> InitialChunksLoader<'a> {
+    /// Bind the initial state read to the local store and reward set.
+    pub fn new(
+        reward_cycle_id: u64,
+        signer_count: u32,
+        stacker_dbs: &'a StackerDBs,
+    ) -> InitialChunksLoader<'a> {
+        InitialChunksLoader {
+            reward_cycle_id,
+            signer_count,
+            stacker_dbs,
+        }
+    }
+
+    /// Read state updates in signer-slot order.
+    fn load_chunks(&self, config: &Config) -> Vec<Option<Vec<u8>>> {
+        if self.signer_count == 0 {
+            return vec![];
+        }
+
+        // the contract that a SignerMessageProcessor actually cares about: The one with
+        // the signer state machine updates
+        let signers_contract = MessageSlotID::StateMachineUpdate
+            .stacker_db_contract(config.is_mainnet(), self.reward_cycle_id);
+        let slot_ids: Vec<u32> = (0..self.signer_count).collect();
+
+        self.stacker_dbs
+            .get_latest_chunks(&signers_contract, slot_ids.as_slice())
+            .inspect_err(|e| warn!("Unable to read the latest signer state from signer db: {e}."))
+            .unwrap_or_default()
+    }
 }
 
 /// Transport-neutral signer message processor and weighted response state.
@@ -189,6 +236,7 @@ impl SignerMessageProcessor {
         node_keep_running: Arc<AtomicBool>,
         keep_running: Arc<AtomicBool>,
         reward_set: &RewardSet,
+        initial_chunks_loader: InitialChunksLoader,
         burn_tip: &BlockSnapshot,
         burnchain: &Burnchain,
         config: &Config,
@@ -296,24 +344,8 @@ impl SignerMessageProcessor {
         let address_weights = parsed_entries.signer_addr_to_weight;
         let mut global_state_evaluator = GlobalStateEvaluator::new(HashMap::new(), address_weights);
         if legacy_ingress_enabled {
-            let signers_contract_id = MessageSlotID::StateMachineUpdate
-                .stacker_db_contract(config.is_mainnet(), reward_cycle_id);
-            let rpc_socket = config
-                .node
-                .get_rpc_loopback()
-                .ok_or_else(|| ChainstateError::MinerAborted)?;
-            let mut signers_session = StackerDBSession::new(
-                &rpc_socket.to_string(),
-                signers_contract_id,
-                config.miner.stackerdb_timeout,
-            );
-            let slot_ids: Vec<_> = parsed_entries.signer_id_to_addr.keys().cloned().collect();
-            let chunks = signers_session
-                .get_latest_chunks(&slot_ids)
-                .inspect_err(|e| {
-                    warn!("Unable to read initial signer state from legacy signer adapter: {e}.")
-                })
-                .unwrap_or_default();
+            let slot_ids: Vec<_> = (0..initial_chunks_loader.signer_count).collect();
+            let chunks = initial_chunks_loader.load_chunks(config);
             for (chunk, slot_id) in chunks.into_iter().zip(slot_ids) {
                 let Some(chunk) = chunk else {
                     continue;
@@ -326,9 +358,7 @@ impl SignerMessageProcessor {
                     continue;
                 };
                 let address = StacksAddress::p2pkh(config.is_mainnet(), &signer_pubkey);
-                if let Ok(SignerMessageV0::StateMachineUpdate(update)) =
-                    SignerMessageV0::consensus_deserialize(&mut chunk.as_slice())
-                {
+                if let Some(update) = StateMachineUpdate::from_signer_message_chunk(&chunk) {
                     global_state_evaluator.insert_update(address, update);
                 }
             }
@@ -570,6 +600,7 @@ impl SignerMessageProcessorComms {
             gathered_signatures: BTreeMap::new(),
             total_weight_approved: 0,
             total_weight_rejected: 0,
+            total_weight_rejected_transient: 0,
             total_weight_unavailable: 0,
             unavailable_signers: HashSet::new(),
             failed_txids: HashMap::new(),
@@ -588,6 +619,7 @@ impl SignerMessageProcessorComms {
             warn!("Native block response author is not in the active reward set");
             return;
         };
+        let transient_rejection = matches!(&response, BlockResponse::Rejected(rejected) if rejected.response_data.reject_reason.is_transient());
         let (sighash, approved, signature, tenure_timestamp, read_count_timestamp, failed_tx) =
             match response {
                 BlockResponse::Accepted(accepted) => {
@@ -608,6 +640,10 @@ impl SignerMessageProcessorComms {
                     )
                 }
                 BlockResponse::Rejected(rejected) => {
+                    if rejected.chain_id != BlockRejection::chain_id_for_network(self.is_mainnet) {
+                        warn!("Ignoring signer rejection for another network");
+                        return;
+                    }
                     if rejected.recover_public_key().ok().as_ref() != Some(signer_pubkey) {
                         warn!("Native block rejection inner author does not match its envelope");
                         return;
@@ -676,6 +712,11 @@ impl SignerMessageProcessorComms {
             block.total_weight_rejected = block
                 .total_weight_rejected
                 .saturating_add(signer_entry.weight);
+            if transient_rejection {
+                block.total_weight_rejected_transient = block
+                    .total_weight_rejected_transient
+                    .saturating_add(signer_entry.weight);
+            }
             if let Some((txid, problematic)) = failed_tx {
                 let info = block.failed_txids.entry(txid).or_default();
                 info.total_weight = info.total_weight.saturating_add(signer_entry.weight);
@@ -801,6 +842,7 @@ impl SignerMessageProcessorComms {
         if let Some(block) = blocks.get_mut(signer_sighash) {
             block.responded_signers.clear();
             block.total_weight_rejected = 0;
+            block.total_weight_rejected_transient = 0;
             block.unavailable_signers.clear();
             block.total_weight_unavailable = 0;
 
@@ -932,7 +974,6 @@ impl SignerMessageProcessorComms {
 
 #[cfg(test)]
 mod unavailable_tests {
-    use super::*;
     use libsigner::v0::messages::{
         BlockAccepted, BlockRejection, BlockResponseData, RejectReason, SignerMessageMetadata,
     };
@@ -941,6 +982,8 @@ mod unavailable_tests {
     use stacks::types::PrivateKey;
     use stacks_network_types::wire::v1::ProposalUnavailableReason;
     use stacks_network_types::PROPOSAL_UNAVAILABLE_VERSION;
+
+    use super::*;
 
     fn comms(
         signer_key: &StacksPrivateKey,
@@ -960,6 +1003,7 @@ mod unavailable_tests {
             gathered_signatures: BTreeMap::new(),
             total_weight_approved: 0,
             total_weight_rejected: 0,
+            total_weight_rejected_transient: 0,
             total_weight_unavailable: 0,
             unavailable_signers: HashSet::new(),
             failed_txids: HashMap::new(),
@@ -1051,6 +1095,48 @@ mod unavailable_tests {
     }
 
     #[test]
+    /// Both adapters share chain-domain checks and reset transient weight on retry.
+    fn authenticated_rejections_check_chain_and_reset_transient_weight() {
+        let key = StacksPrivateKey::from_seed(b"transient-rejection");
+        let public_key = StacksPublicKey::from_private(&key);
+        let header = NakamotoBlockHeader::empty();
+        let hash = header.signer_signature_hash();
+        let comms = comms(&key, hash.clone());
+        for mainnet in [true, false] {
+            let rejection = BlockRejection::new(
+                hash.clone(),
+                RejectReason::NoSignerConsensus,
+                &key,
+                mainnet,
+                0,
+                0,
+            );
+            for _ in 0..2 {
+                comms.process_authenticated_message(
+                    &public_key,
+                    SignerMessageV0::BlockResponse(BlockResponse::Rejected(rejection.clone())),
+                );
+            }
+            let status = comms
+                .wait_for_block_status(&hash, Duration::ZERO, |_| false)
+                .unwrap()
+                .unwrap();
+            let expected = if mainnet { 0 } else { 3 };
+            assert_eq!(status.total_weight_rejected, expected);
+            assert_eq!(status.total_weight_rejected_transient, expected);
+            assert_eq!(status.responded_signers.len(), usize::from(!mainnet));
+        }
+        comms.reset_rejections(&hash);
+        let status = comms
+            .wait_for_block_status(&hash, Duration::ZERO, |_| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.total_weight_rejected, 0);
+        assert_eq!(status.total_weight_rejected_transient, 0);
+        assert!(status.responded_signers.is_empty());
+    }
+
+    #[test]
     fn genuine_validation_rejection_survives_unavailable_reset_and_terminates_round() {
         let signer_key = StacksPrivateKey::from_seed(b"validation-rejecting-signer");
         let signer_pubkey = StacksPublicKey::from_private(&signer_key);
@@ -1070,7 +1156,7 @@ mod unavailable_tests {
         // silently proving only a synthetic policy rejection.
         let companion_rejection = BlockValidateReject {
             signer_signature_hash: sighash.clone(),
-            reason: "companion rejected invalid proposal".to_owned(),
+            reason: "companion rejected invalid proposal".try_into().unwrap(),
             reason_code: ValidateRejectCode::InvalidBlock,
             failed_txid: None,
         };
@@ -1092,9 +1178,9 @@ mod unavailable_tests {
             .expect("status exists");
         assert_eq!(status.total_weight_unavailable, 0);
         assert_eq!(status.total_weight_rejected, 3);
-        assert!(matches!(
+        std::assert_matches!(
             crate::nakamoto_node::signer_coordinator::signer_rejection_error(&status, 3, 3),
             Some(NakamotoNodeError::SignersRejected { .. })
-        ));
+        );
     }
 }

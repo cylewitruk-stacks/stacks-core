@@ -19,6 +19,7 @@ use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use clarity::vm::types::QualifiedContractIdentifier;
 use mio::{self, net as mio_net};
@@ -45,9 +46,10 @@ use crate::chainstate::stacks::StacksBlockHeader;
 use crate::core::{EpochList, StacksEpoch};
 use crate::monitoring::{update_inbound_neighbors, update_outbound_neighbors};
 use crate::net::atlas::{AtlasDB, AttachmentsDownloader};
-use crate::net::chat::{ConversationP2P, NeighborStats};
+use crate::net::chat::{ConversationP2P, InboundBudget, NeighborStats};
 use crate::net::connection::{ConnectionOptions, ReplyHandleP2P};
 use crate::net::db::{LocalPeer, PeerDB};
+use crate::net::download::epoch2x::{BlockDownloadOutcome, DownloadProgress};
 use crate::net::download::nakamoto::NakamotoDownloadStateMachine;
 use crate::net::download::BlockDownloader;
 use crate::net::inv::inv2x::*;
@@ -93,6 +95,12 @@ struct NetworkHandleServer {
 impl NetworkHandle {
     pub fn new(chan_in: SyncSender<NetworkRequest>) -> NetworkHandle {
         NetworkHandle { chan_in }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel(bufsz: usize) -> (Receiver<NetworkRequest>, NetworkHandle) {
+        let (msg_send, msg_recv) = sync_channel(bufsz);
+        (msg_recv, NetworkHandle::new(msg_send))
     }
 
     /// Send out a command to the p2p thread.  Do not bother waiting for the response.
@@ -183,7 +191,25 @@ pub enum PeerNetworkWorkState {
 }
 
 pub type PeerMap = HashMap<usize, ConversationP2P>;
-pub type PendingMessages = HashMap<(usize, NeighborKey), Vec<StacksMessage>>;
+
+/// Unsolicited messages from one authenticated peer, plus that peer's address
+/// (IP + node public-key hash).
+#[derive(Clone, Debug)]
+pub struct PendingMessagesFrom {
+    pub neighbor_addr: NeighborAddress,
+    pub messages: Vec<StacksMessage>,
+}
+
+impl PendingMessagesFrom {
+    pub fn new(neighbor_addr: NeighborAddress, messages: Vec<StacksMessage>) -> Self {
+        Self {
+            neighbor_addr,
+            messages,
+        }
+    }
+}
+
+pub type PendingMessages = HashMap<(usize, NeighborKey), PendingMessagesFrom>;
 
 pub struct ConnectingPeer {
     socket: mio_net::TcpStream,
@@ -482,6 +508,17 @@ impl CrossTransportRelayPolicy {
     }
 }
 
+/// Outcome of running one p2p conversation in a network pass
+struct ConvoPassResult {
+    /// messages received that no other thread was waiting for
+    unhandled: Vec<StacksMessage>,
+    /// is the conversation still usable?
+    alive: bool,
+    /// must we come back to this conversation next pass, because we left its socket unread or
+    /// still have messages queued?
+    revisit: bool,
+}
+
 pub struct PeerNetwork {
     // constants
     pub peer_version: u32,
@@ -660,6 +697,27 @@ pub struct PeerNetwork {
     /// tenure inventories
     pub nakamoto_inv_generator: InvGenerator,
 
+    /// Epoch 2.x cache of chainstate data, for the purposes of generating block inventories
+    pub blocks_inv_cache: BlocksInvCache,
+
+    /// Event IDs of p2p conversations with work left over from the last network pass: their
+    /// inbox still had messages after `max_inbound_messages_per_pass` or
+    /// `max_inbound_processing_ms`, their socket was left unread because of such a backlog, or
+    /// the pass ran out of `max_inbound_processing_ms` before reaching them.  Their sockets are
+    /// edge-triggered, so they won't be reported as ready again until more data arrives; they are
+    /// processed first in the next pass instead.
+    pending_inbound_convos: Vec<usize>,
+
+    /// Event IDs of conversations in `pending_inbound_convos` whose socket failed while sending
+    /// outside of `process_ready_sockets`.  They are kept until the next pass, which drains their
+    /// leftover inbound work and then drops them.
+    broken_inbound_convos: HashSet<usize>,
+
+    /// Treat the `max_inbound_processing_ms` deadline as already passed in every network pass,
+    /// so each pass handles a single conversation
+    #[cfg(test)]
+    pub(crate) test_inbound_deadline_passed: bool,
+
     /// Thread handle for the async block proposal endpoint.
     block_proposal_thread: Option<JoinHandle<()>>,
 
@@ -830,6 +888,12 @@ impl PeerNetwork {
             fault_last_disconnect: 0,
 
             nakamoto_inv_generator: InvGenerator::new(),
+            blocks_inv_cache: BlocksInvCache::default(),
+
+            pending_inbound_convos: vec![],
+            broken_inbound_convos: HashSet::new(),
+            #[cfg(test)]
+            test_inbound_deadline_passed: false,
 
             block_proposal_thread: None,
 
@@ -852,10 +916,10 @@ impl PeerNetwork {
             return false;
         };
         if block_proposal_thread.is_finished() {
-            return false;
+            false
         } else {
             self.block_proposal_thread = Some(block_proposal_thread);
-            return true;
+            true
         }
     }
 
@@ -1215,10 +1279,9 @@ impl PeerNetwork {
         event_id: usize,
         handle: &mut ReplyHandleP2P,
     ) -> Result<(usize, bool), net_error> {
-        let res = self.with_p2p_convo(event_id, |_network, convo, client_sock| {
+        self.with_p2p_convo(event_id, |_network, convo, client_sock| {
             PeerNetwork::do_saturate_p2p_socket(convo, client_sock, handle)
-        })?;
-        res
+        })?
     }
 
     /// Send a message via a given conversation
@@ -1234,9 +1297,9 @@ impl PeerNetwork {
             return Ok(rh);
         }
         info!("No ongoing conversation for event {event_id}");
-        return Err(net_error::PeerNotConnected(format!(
+        Err(net_error::PeerNotConnected(format!(
             "No ongoing conversation for event {event_id}",
-        )));
+        )))
     }
 
     /// Send a message to a peer.
@@ -1252,7 +1315,7 @@ impl PeerNetwork {
             return self.send_p2p_message(*event_id, message, ttl);
         }
         info!("Not connected to {:?}", &neighbor_key);
-        return Err(net_error::NoSuchNeighbor);
+        Err(net_error::NoSuchNeighbor)
     }
 
     /// Add an ongoing message handle to the network's internal relay handles
@@ -1400,22 +1463,6 @@ impl PeerNetwork {
             if convo.stats.outbound {
                 ret += 1;
             }
-        }
-        ret
-    }
-
-    /// Count how many connections to a given IP address we have
-    pub fn count_ip_connections(
-        ipaddr: &SocketAddr,
-        sockets: &HashMap<usize, mio_net::TcpStream>,
-    ) -> u64 {
-        let mut ret = 0;
-        for (_, socket) in sockets.iter() {
-            if let Ok(addr) = socket.peer_addr() {
-                if addr.ip() == ipaddr.ip() {
-                    ret += 1;
-                }
-            };
         }
         ret
     }
@@ -2035,7 +2082,7 @@ impl PeerNetwork {
                     }
                 }
             }
-            return Ok(());
+            Ok(())
         })
     }
 
@@ -2177,6 +2224,21 @@ impl PeerNetwork {
             peer.port,
         );
 
+        // connections still being opened are not in `self.events` yet
+        let connecting = self.connecting.extract_if(|_, connecting| {
+            connecting.nk.addrbytes == peer.address && connecting.nk.port == peer.port
+        });
+        for (event_id, ConnectingPeer { socket, .. }) in connecting {
+            debug!("Dropping connecting neighbor!";
+                "event id" => event_id,
+                "public addr" => peer.address.pretty_print(),
+                "reason" => %reason
+            );
+            if let Some(ref mut network) = self.network {
+                let _ = network.deregister(event_id, &socket);
+            }
+        }
+
         let mut nk_remove = vec![];
         for (neighbor_key, event_id) in self.events.iter() {
             if neighbor_key.addrbytes == peer.address && neighbor_key.port == peer.port {
@@ -2200,6 +2262,8 @@ impl PeerNetwork {
                 self.pending_messages.remove(&(event_id, nk.clone()));
                 self.pending_stacks_messages.remove(&(event_id, nk.clone()));
 
+                // connecting peers were removed above, and are never in `self.events`
+                debug_assert!(!self.connecting.contains_key(&event_id));
                 match self.network {
                     None => {}
                     Some(ref mut network) => {
@@ -2207,15 +2271,10 @@ impl PeerNetwork {
                         if let Some(socket) = self.sockets.remove(&event_id) {
                             let _ = network.deregister(event_id, &socket);
                         }
-                        // deregister socket if still connecting
-                        if let Some(ConnectingPeer { socket, .. }) =
-                            self.connecting.remove(&event_id)
-                        {
-                            let _ = network.deregister(event_id, &socket);
-                        }
                     }
                 }
                 self.relay_handles.remove(&event_id);
+                self.broken_inbound_convos.remove(&event_id);
                 self.peers.remove(&event_id);
             }
             // remove inventory state
@@ -2444,7 +2503,10 @@ impl PeerNetwork {
     }
 
     /// Process network traffic on a p2p conversation.
-    /// Returns list of unhandled messages, and whether or not the convo is still alive.
+    /// Stops handling queued messages once `deadline` passes, unless the socket has failed: such
+    /// a conversation is dropped after this pass, so everything it already sent is handled now.
+    /// Returns list of unhandled messages, whether or not the convo is still alive, and whether
+    /// or not it must be revisited next pass.
     fn process_p2p_conversation(
         &mut self,
         event_id: usize,
@@ -2452,11 +2514,46 @@ impl PeerNetwork {
         chainstate: &mut StacksChainState,
         dns_client_opt: &mut Option<&mut DNSClient>,
         ibd: bool,
-    ) -> Result<(Vec<StacksMessage>, bool), net_error> {
+        deadline: Option<Instant>,
+    ) -> Result<ConvoPassResult, net_error> {
         self.with_p2p_convo(event_id, |network, convo, client_sock| {
             // get incoming bytes and update the state of this conversation.
-            let mut convo_dead = false;
-            if let Err(e) = convo.recv(client_sock) {
+            // If `max_inbound_messages_per_pass` or `max_inbound_processing_ms` left messages
+            // queued from the last pass, don't read more until they're handled: reading into a
+            // non-empty inbox could overflow it (which kills the conversation).  The unread bytes
+            // stay in the socket buffer, which is what pushes back on the remote peer.  The
+            // caller keeps this conversation in `pending_inbound_convos` so the socket is read
+            // again once the backlog is drained.
+            let mut convo_dead = network.broken_inbound_convos.remove(&event_id);
+            let inbox_backlog = convo.connection.inbox_len();
+            let deferred_recv = inbox_backlog > 0;
+            if convo_dead {
+                // a send failed after the last pass left work on this conversation, so it's
+                // dropped after this pass.  Read whatever the remote peer sent before it hung up.
+                debug!(
+                    "{:?}: Socket on event {} failed with work left over; draining {:?}",
+                    &network.get_local_peer(),
+                    event_id,
+                    &client_sock
+                );
+                if let Err(e) = convo.recv(client_sock) {
+                    debug!(
+                        "{:?}: Failed to receive data on event {} (socket {:?}): {:?}",
+                        &network.get_local_peer(),
+                        event_id,
+                        &client_sock,
+                        &e
+                    );
+                }
+            } else if deferred_recv {
+                debug!(
+                    "{:?}: {} messages still queued on event {}; not reading from socket {:?} this pass",
+                    &network.get_local_peer(),
+                    inbox_backlog,
+                    event_id,
+                    &client_sock
+                );
+            } else if let Err(e) = convo.recv(client_sock) {
                 match e {
                     net_error::PermanentlyDrained => {
                         // socket got closed, but we might still have pending unsolicited messages
@@ -2482,8 +2579,22 @@ impl PeerNetwork {
 
             // react to inbound messages -- do we need to send something out, or fulfill requests
             // to other threads?  Try to chat even if the recv() failed, since we'll want to at
-            // least drain the conversation inbox.
-            let unhandled = match convo.chat(network, sortdb, chainstate, dns_client_opt, ibd) {
+            // least drain the conversation inbox: the conversation is dropped after this pass,
+            // and solicited replies in its inbox still have handles waiting on them.  Such a
+            // drain ignores the per-pass limits; it is bounded by `inbox_maxlen` instead.
+            let budget = if convo_dead {
+                InboundBudget::unbounded()
+            } else {
+                InboundBudget::new(convo.connection.options.max_inbound_messages_per_pass, deadline)
+            };
+            let mut unhandled = match convo.chat_within(
+                network,
+                sortdb,
+                chainstate,
+                dns_client_opt,
+                ibd,
+                budget,
+            ) {
                 Err(e) => {
                     debug!(
                         "Failed to converse on event {} (socket {:?}): {:?}",
@@ -2504,9 +2615,49 @@ impl PeerNetwork {
                         event_id, &client_sock, &e
                     );
                     convo_dead = true;
+
+                    // the conversation is dropped after this pass, so drain whatever the limits
+                    // left queued, as when recv() fails.  If the socket was left unread because
+                    // of a backlog, this is how we find out that the remote peer hung up, and it
+                    // may have sent more before it did, so read that too.
+                    if deferred_recv {
+                        if let Err(e) = convo.recv(client_sock) {
+                            debug!(
+                                "{:?}: Failed to receive data on event {} (socket {:?}): {:?}",
+                                &network.get_local_peer(),
+                                event_id,
+                                &client_sock,
+                                &e
+                            );
+                        }
+                    }
+                    if convo.connection.inbox_len() > 0 {
+                        match convo.chat_within(
+                            network,
+                            sortdb,
+                            chainstate,
+                            dns_client_opt,
+                            ibd,
+                            InboundBudget::unbounded(),
+                        ) {
+                            Err(e) => {
+                                debug!(
+                                    "Failed to converse on event {} (socket {:?}): {:?}",
+                                    event_id, &client_sock, &e
+                                );
+                            }
+                            Ok(mut unhandled_messages) => {
+                                unhandled.append(&mut unhandled_messages)
+                            }
+                        }
+                    }
                 }
             }
-            (unhandled, !convo_dead)
+            ConvoPassResult {
+                unhandled,
+                alive: !convo_dead,
+                revisit: !convo_dead && (deferred_recv || convo.connection.inbox_len() > 0),
+            }
         })
     }
 
@@ -2535,6 +2686,9 @@ impl PeerNetwork {
 
     /// Process sockets that are ready, but specifically inbound or outbound only.
     /// Advance the state of all such conversations with remote peers.
+    /// Conversations left over from the last pass are processed first.  Stops handling messages
+    /// once `max_inbound_processing_ms` has elapsed, and remembers the conversations it skipped
+    /// (and the ones with messages still queued or sockets left unread) for the next pass.
     /// Return the list of events that correspond to failed conversations, as well as the set of
     /// unhandled messages grouped by event_id.
     fn process_ready_sockets(
@@ -2548,15 +2702,55 @@ impl PeerNetwork {
         let mut to_remove = vec![];
         let mut unhandled: HashMap<usize, Vec<StacksMessage>> = HashMap::new();
 
-        for event_id in &poll_state.ready {
-            let (mut convo_unhandled, alive) = match self.process_p2p_conversation(
+        let mut event_ids = mem::take(&mut self.pending_inbound_convos);
+        event_ids.retain(|event_id| self.peers.contains_key(event_id));
+        let mut seen: HashSet<usize> = event_ids.iter().copied().collect();
+        for event_id in poll_state.ready.iter() {
+            if seen.insert(*event_id) {
+                event_ids.push(*event_id);
+            }
+        }
+
+        let max_processing_ms = self.connection_opts.max_inbound_processing_ms;
+        let deadline = (max_processing_ms > 0)
+            .then(|| Instant::now().checked_add(Duration::from_millis(max_processing_ms)))
+            .flatten();
+        #[cfg(test)]
+        let deadline = if self.test_inbound_deadline_passed {
+            Some(Instant::now())
+        } else {
+            deadline
+        };
+        let mut processed = 0;
+        let mut leftover = vec![];
+
+        for event_id in event_ids.iter() {
+            // always make progress on at least one conversation
+            if processed > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                debug!(
+                    "{:?}: spent over {}ms processing {} conversations; deferring {} to the next pass",
+                    &self.local_peer,
+                    max_processing_ms,
+                    processed,
+                    event_ids.len().saturating_sub(processed)
+                );
+                break;
+            }
+            processed += 1;
+
+            let ConvoPassResult {
+                unhandled: mut convo_unhandled,
+                alive,
+                revisit,
+            } = match self.process_p2p_conversation(
                 *event_id,
                 sortdb,
                 chainstate,
                 dns_client_opt,
                 ibd,
+                deadline,
             ) {
-                Ok((convo_unhandled, alive)) => (convo_unhandled, alive),
+                Ok(res) => res,
                 Err(e) => {
                     let convo = self.get_p2p_convo(*event_id);
                     debug!(
@@ -2578,6 +2772,10 @@ impl PeerNetwork {
                     continue;
                 }
             };
+
+            if revisit {
+                leftover.push(*event_id);
+            }
 
             if !alive {
                 let convo = self.get_p2p_convo(*event_id);
@@ -2607,7 +2805,18 @@ impl PeerNetwork {
             }
         }
 
+        // conversations we never got to go before ones we already served this pass
+        let mut skipped = event_ids.split_off(processed);
+        skipped.append(&mut leftover);
+        self.pending_inbound_convos = skipped;
+
         (to_remove, unhandled)
+    }
+
+    /// Do we need to call .run() again, shortly, to process inbound messages left over from the
+    /// last pass?
+    pub fn has_pending_inbound_work(&self) -> bool {
+        !self.pending_inbound_convos.is_empty()
     }
 
     /// Get stats for a neighbor
@@ -2694,15 +2903,15 @@ impl PeerNetwork {
                     &peer.socket,
                     event_id,
                     &peer.nk,
-                    self.connection_opts.timeout,
-                    peer.timestamp + self.connection_opts.timeout,
+                    self.connection_opts.connect_timeout,
+                    peer.timestamp + self.connection_opts.connect_timeout,
                     now
                 );
                 to_remove.push(DropPeer {
                     address: peer.nk.addrbytes.clone(),
                     port: peer.nk.port,
                     reason: DropReason::Unresponsive {
-                        timeout: self.connection_opts.timeout,
+                        timeout: self.connection_opts.connect_timeout,
                         last_seen: peer.timestamp,
                         status: PeerStatus::Connecting,
                     },
@@ -2901,13 +3110,15 @@ impl PeerNetwork {
 
     /// Flush relayed message handles, but don't block.
     /// Drop broken handles.
-    /// Return the list of broken conversation event IDs
-    fn flush_relay_handles(&mut self) -> Vec<DropPeer> {
+    /// Return the list of broken conversation event IDs, except for the ones with inbound work
+    /// left over from the last pass, which are kept in `broken_inbound_convos` until the next
+    /// pass drains them.
+    pub(crate) fn flush_relay_handles(&mut self) -> Vec<DropPeer> {
         let mut broken = vec![];
         let mut drained = vec![];
 
         // flush each outgoing conversation
-        let mut relay_handles = std::mem::replace(&mut self.relay_handles, HashMap::new());
+        let mut relay_handles = mem::take(&mut self.relay_handles);
         for (event_id, handle_list) in relay_handles.iter_mut() {
             if handle_list.is_empty() {
                 debug!("No handles for event {}", event_id);
@@ -2941,9 +3152,9 @@ impl PeerNetwork {
                         );
                         return Ok((num_sent, flushed));
                     }
-                    return Err(net_error::PeerNotConnected(format!(
+                    Err(net_error::PeerNotConnected(format!(
                         "No relay handles for event {event_id}",
-                    )));
+                    )))
                 });
 
                 let (num_sent, flushed) = match res {
@@ -2951,7 +3162,15 @@ impl PeerNetwork {
                     Ok(Err(e)) | Err(e) => {
                         // connection broken; next list
                         debug!("Relay handle broken to event {event_id}");
-                        if let Some(peer) = self.peers.get(event_id) {
+                        if self.pending_inbound_convos.contains(event_id) {
+                            // the last pass left inbound work on this conversation, so let the
+                            // next pass drain it before dropping the peer
+                            debug!(
+                                "{:?}: Event {event_id} has inbound work left over; dropping it after the next pass",
+                                &self.local_peer
+                            );
+                            self.broken_inbound_convos.insert(*event_id);
+                        } else if let Some(peer) = self.peers.get(event_id) {
                             broken.push(DropPeer {
                                 address: peer.peer_addrbytes.clone(),
                                 port: peer.peer_port,
@@ -3033,7 +3252,7 @@ impl PeerNetwork {
         // pick a random outbound conversation to one of the initial neighbors
         let mut idx = thread_rng().gen::<usize>() % self.peers.len();
         for _ in 0..self.peers.len() + 1 {
-            let event_id = match self.peers.keys().skip(idx).next() {
+            let event_id = match self.peers.keys().nth(idx) {
                 Some(eid) => *eid,
                 None => {
                     idx = 0;
@@ -3191,7 +3410,7 @@ impl PeerNetwork {
             }
         }
 
-        return Ok(true);
+        Ok(true)
     }
 
     /// Do we need to (re)fetch our public IP?
@@ -3231,7 +3450,7 @@ impl PeerNetwork {
             }
         }
 
-        return true;
+        true
     }
 
     /// Reset all state for querying our public IP address
@@ -3311,15 +3530,18 @@ impl PeerNetwork {
             self.init_block_downloader();
         }
 
-        let (
-            done,
-            at_chain_tip,
-            old_pox_id,
-            mut blocks,
-            mut microblocks,
+        let BlockDownloadOutcome {
+            progress:
+                DownloadProgress {
+                    done,
+                    at_chain_tip,
+                    old_pox_id,
+                    mut blocks,
+                    mut microblocks,
+                },
             broken_http_peers,
             broken_p2p_peers,
-        ) = match self.download_blocks(sortdb, chainstate, dns_client, ibd) {
+        } = match self.download_blocks(sortdb, chainstate, dns_client, ibd) {
             Ok(x) => x,
             Err(net_error::NotConnected) => {
                 // there was simply nothing to do
@@ -3354,14 +3576,14 @@ impl PeerNetwork {
             let mut block_set = HashSet::new();
             let mut microblock_set = HashSet::new();
 
-            for (_, block, _) in network_result.blocks.iter() {
+            for Downloaded { data: block, .. } in network_result.blocks.iter() {
                 if block_set.contains(&block.block_hash()) {
                     debug!("Duplicate block {}", block.block_hash());
                 }
                 block_set.insert(block.block_hash());
             }
 
-            for (_, mblocks, _) in network_result.confirmed_microblocks.iter() {
+            for Downloaded { data: mblocks, .. } in network_result.confirmed_microblocks.iter() {
                 for mblock in mblocks.iter() {
                     if microblock_set.contains(&mblock.block_hash()) {
                         debug!("Duplicate microblock {}", mblock.block_hash());
@@ -3466,9 +3688,9 @@ impl PeerNetwork {
                 "{:?}: AntiEntropy: Peer {:?} is missing Stacks block {} from height {}, which we have",
                 &self.local_peer, nk, &index_block_hash, height
             );
-            return Some((ancestor_sn.consensus_hash, block));
+            Some((ancestor_sn.consensus_hash, block))
         } else {
-            return None;
+            None
         }
     }
 
@@ -3570,13 +3792,13 @@ impl PeerNetwork {
                 "{:?}: AntiEntropy: Peer {:?} is missing Stacks microblocks {} from height {}, which we have",
                 &self.local_peer, nk, &index_block_hash, height
             );
-            return Some((
+            Some((
                 block_info.parent_consensus_hash,
                 block_info.parent_anchored_block_hash,
                 microblocks,
-            ));
+            ))
         } else {
-            return None;
+            None
         }
     }
 
@@ -3959,6 +4181,33 @@ impl PeerNetwork {
         !(epoch_id >= StacksEpochId::Epoch30 && self.stacks_tip.is_nakamoto)
     }
 
+    /// Can epoch 2.x blocks still be processed or orphaned by this node?
+    /// The chains coordinator keeps running its epoch 2.x handler throughout the first Nakamoto
+    /// reward cycle, and afterwards only until the Stacks tip is a Nakamoto block.  So the epoch
+    /// 2.x chainstate is final only once the Stacks tip is a Nakamoto block AND the burnchain tip
+    /// is past the first Nakamoto reward cycle.
+    pub(crate) fn epoch2_chainstate_is_final(&self) -> bool {
+        if !self.stacks_tip.is_nakamoto {
+            return false;
+        }
+        let Some(epoch3) = self.epochs.get(StacksEpochId::Epoch30) else {
+            return false;
+        };
+        let Some(first_nakamoto_reward_cycle) = self
+            .burnchain
+            .block_height_to_reward_cycle(epoch3.start_height)
+        else {
+            return false;
+        };
+        let Some(current_reward_cycle) = self
+            .burnchain
+            .block_height_to_reward_cycle(self.burnchain_tip.block_height)
+        else {
+            return false;
+        };
+        current_reward_cycle > first_nakamoto_reward_cycle
+    }
+
     /// Do the actual work in the state machine.
     /// Return true if we need to prune connections.
     /// This will call the epoch-appropriate network worker
@@ -4131,7 +4380,7 @@ impl PeerNetwork {
                             let done = self.do_network_block_download(
                                 sortdb,
                                 chainstate,
-                                *dns_client,
+                                dns_client,
                                 ibd,
                                 network_result,
                             );
@@ -4215,9 +4464,9 @@ impl PeerNetwork {
                     |network, attachments_downloader| {
                         let mut dead_events = vec![];
                         match attachments_downloader.run(dns_client, network) {
-                            Ok((ref mut attachments, ref mut events_to_deregister)) => {
-                                network_result.attachments.append(attachments);
-                                dead_events.append(events_to_deregister);
+                            Ok(mut progress) => {
+                                network_result.attachments.append(&mut progress.resolved_attachments);
+                                dead_events.append(&mut progress.events_to_deregister);
                             }
                             Err(e) => {
                                 warn!(
@@ -4441,7 +4690,7 @@ impl PeerNetwork {
                     if self.walk_pingbacks.len() > MAX_NEIGHBORS_DATA_LEN as usize {
                         // drop one at random
                         let idx = thread_rng().gen::<usize>() % self.walk_pingbacks.len();
-                        let drop_addr = match self.walk_pingbacks.keys().skip(idx).next() {
+                        let drop_addr = match self.walk_pingbacks.keys().nth(idx) {
                             Some(addr) => (*addr).clone(),
                             None => {
                                 continue;
@@ -4536,7 +4785,7 @@ impl PeerNetwork {
         sortdb: &SortitionDB,
         chainstate: &mut StacksChainState,
     ) -> Result<(), net_error> {
-        let stacker_db_configs = mem::replace(&mut self.stacker_db_configs, HashMap::new());
+        let stacker_db_configs = mem::take(&mut self.stacker_db_configs);
         self.stacker_db_configs = self.stackerdbs.create_or_reconfigure_stackerdbs(
             chainstate,
             sortdb,
@@ -4819,9 +5068,9 @@ impl PeerNetwork {
     /// Refresh view of burnchain, if needed.
     /// If the burnchain view changes, then take the following additional steps:
     /// * hint to the inventory sync state-machine to restart, since we potentially have a new
-    /// block to go fetch
+    ///   block to go fetch
     /// * hint to the download state machine to start looking for the new block at the new
-    /// stable sortition height
+    ///   stable sortition height
     /// * hint to the antientropy protocol to reset to the latest reward cycle
     pub fn refresh_burnchain_view(
         &mut self,
@@ -5014,9 +5263,9 @@ impl PeerNetwork {
                 &canonical_sn.consensus_hash,
                 self.pending_messages
                     .iter()
-                    .fold(0, |acc, (_, msgs)| acc + msgs.len())
+                    .fold(0, |acc, (_, inbox)| acc + inbox.messages.len())
             );
-            let buffered_messages = mem::replace(&mut self.pending_messages, HashMap::new());
+            let buffered_messages = mem::take(&mut self.pending_messages);
             let unhandled = self.handle_unsolicited_sortition_messages(
                 sortdb,
                 chainstate,
@@ -5035,10 +5284,9 @@ impl PeerNetwork {
                 &canonical_sn.consensus_hash,
                 self.pending_stacks_messages
                     .iter()
-                    .fold(0, |acc, (_, msgs)| acc + msgs.len())
+                    .fold(0, |acc, (_, inbox)| acc + inbox.messages.len())
             );
-            let buffered_stacks_messages =
-                mem::replace(&mut self.pending_stacks_messages, HashMap::new());
+            let buffered_stacks_messages = mem::take(&mut self.pending_stacks_messages);
             let unhandled = self.handle_unsolicited_stacks_messages(
                 chainstate,
                 buffered_stacks_messages,
@@ -5311,7 +5559,7 @@ impl PeerNetwork {
         }
 
         debug!("Stored tx {}", txid);
-        return true;
+        true
     }
 
     /// Store all inbound transactions, and return the ones that we actually stored so they can be
@@ -5554,10 +5802,7 @@ impl PeerNetwork {
                 debug!("{:?}: network not connected", &self.local_peer);
                 Err(net_error::NotConnected)
             }
-            Some(ref mut network) => {
-                let poll_result = network.poll(poll_timeout);
-                poll_result
-            }
+            Some(ref mut network) => network.poll(poll_timeout),
         }?;
 
         let p2p_poll_state = match self.p2p_network_handle {
@@ -5666,7 +5911,6 @@ mod test {
     use std::{thread, time};
 
     use clarity::util::sleep_ms;
-    use rand::{self, RngCore};
     use stacks_common::types::chainstate::BurnchainHeaderHash;
 
     use super::*;
@@ -5678,15 +5922,8 @@ mod test {
     use crate::net::*;
     use crate::util_lib::test::*;
 
-    fn make_random_peer_address() -> PeerAddress {
-        let mut rng = rand::thread_rng();
-        let mut bytes = [0u8; 16];
-        rng.fill_bytes(&mut bytes);
-        PeerAddress(bytes)
-    }
-
     fn make_test_neighbor(port: u16) -> Neighbor {
-        let neighbor = Neighbor {
+        Neighbor {
             addr: NeighborKey {
                 peer_version: 0x12345678,
                 network_id: 0x9abcdef0,
@@ -5708,8 +5945,7 @@ mod test {
             org: 45678,
             in_degree: 1,
             out_degree: 1,
-        };
-        neighbor
+        }
     }
 
     #[test]
@@ -5783,7 +6019,8 @@ mod test {
         let burnchain_db = BurnchainDB::connect(":memory:", &burnchain, true).unwrap();
 
         let local_peer = PeerDB::get_local_peer(db.conn()).unwrap();
-        let p2p = PeerNetwork::new(
+
+        PeerNetwork::new(
             db,
             atlasdb,
             stacker_db,
@@ -5795,8 +6032,7 @@ mod test {
             conn_opts,
             HashMap::new(),
             StacksEpoch::unit_test_up_to(0, StacksEpochId::Epoch20),
-        );
-        p2p
+        )
     }
 
     #[test]
@@ -6106,5 +6342,47 @@ mod test {
         assert!(peer_1.network.is_connecting(1));
         assert!(peer_1.network.is_connecting_neighbor(&nk));
         assert!(comms.is_neighbor_connecting(&peer_1.network, &nk));
+    }
+
+    #[test]
+    fn test_disconnect_unresponsive_connecting_peer() {
+        let peer_1_config = TestPeerConfig::new(function_name!(), 0, 0);
+        let peer_2_config = TestPeerConfig::new(function_name!(), 0, 0);
+        let mut peer_1 = TestPeer::new(peer_1_config);
+        let peer_2 = TestPeer::new(peer_2_config);
+        let nk = peer_2.to_neighbor().addr;
+        let comms = PeerNetworkComms::new();
+
+        let num_events = peer_1.network.network.as_ref().unwrap().num_events();
+        let event_id = peer_1.network.connect_peer(&nk).unwrap();
+        assert!(peer_1.network.is_connecting(event_id));
+        assert!(comms.is_neighbor_connecting(&peer_1.network, &nk));
+        assert_eq!(
+            peer_1.network.network.as_ref().unwrap().num_events(),
+            num_events + 1
+        );
+
+        // not timed out yet
+        assert_eq!(peer_1.network.disconnect_unresponsive(), 0);
+        assert!(peer_1.network.is_connecting(event_id));
+
+        // pretend the connection attempt started long ago
+        peer_1
+            .network
+            .connecting
+            .get_mut(&event_id)
+            .unwrap()
+            .timestamp = 0;
+        assert_eq!(peer_1.network.disconnect_unresponsive(), 1);
+
+        // the attempt is gone, so callers like `PeerNetworkComms` and StackerDB sync will retry
+        // it, and its socket is no longer registered
+        assert!(!peer_1.network.is_connecting(event_id));
+        assert!(!peer_1.network.is_connecting_neighbor(&nk));
+        assert!(!comms.is_neighbor_connecting(&peer_1.network, &nk));
+        assert_eq!(
+            peer_1.network.network.as_ref().unwrap().num_events(),
+            num_events
+        );
     }
 }

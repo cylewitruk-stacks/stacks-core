@@ -1,6 +1,6 @@
 [package]
 name = "stacks-signer"
-version = "0.0.1"
+version.workspace = true
 authors = [ "Jude Nelson <jude@stacks.org>" ]
 license = "GPLv3"
 homepage = "https://github.com/blockstack/stacks-blockchain"
@@ -28,14 +28,12 @@ libsigner = { path = "../libsigner" }
 libstackerdb = { path = "../libstackerdb" }
 libp2p = { workspace = true }
 prost = { workspace = true }
-prometheus = { version = "0.9", optional = true }
+prometheus = { version = "0.14", default-features = false, optional = true }
 rand_core = "0.6"
-reqwest = { version = "0.11.22", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { workspace = true }
 serde = "1"
-slog = { version = "2.5.2", features = [ "max_level_trace" ] }
-slog-json = { version = "2.3.0", optional = true }
-slog-term = "2.6.0"
-stacks-common = { path = "../stacks-common" }
+slog = { workspace = true }
+stacks-common = { path = "../stacks-common", features = ["rusqlite"] }
 stacks-network = { path = "../stacks-network" }
 stacks-network-types = { workspace = true }
 stacks-signer-bridge = { path = "../stacks-signer-bridge" }

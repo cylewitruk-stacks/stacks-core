@@ -18,8 +18,25 @@ use std::time::Instant;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use stacks_marf::Error;
 
-use crate::chainstate::stacks::index::Error;
+use crate::util_lib::db::Error as db_error;
+
+/// Map a `util_lib::db` error onto the MARF error type this module reports.
+///
+/// The snapshot code reports MARF errors throughout, but reaches for the shared
+/// SQLite helpers, which report `db_error`. Today an `impl From<db_error> for
+/// Error` makes that implicit; once the MARF moves to its own crate that impl
+/// becomes impossible -- the MARF error type would be defined outside this
+/// crate, so the orphan rule rules it out. Converting explicitly here keeps the
+/// mapping identical and survives the move.
+pub fn marf_err(e: db_error) -> Error {
+    match e {
+        db_error::SqliteError(se) => Error::SQLError(se),
+        db_error::NotFoundError => Error::NotFoundError,
+        _ => Error::CorruptionError(format!("{e}")),
+    }
+}
 
 /// Build a [`DbSnapshotSpec::classify_hint`] string -- `"<fn>() in <file>"`,
 /// optionally with extra prose before the file -- from the spec function itself,
@@ -122,6 +139,7 @@ impl<'a, B> TableCopySpecs<'a, B> {
 
     /// The subset whose schema is cloned but no rows are copied
     /// ([`TableCopySource::SchemaOnly`]).
+    #[cfg(test)]
     pub fn schema_only(&self) -> Vec<&'static str> {
         self.iter()
             .filter(|s| matches!(s.source, TableCopySource::SchemaOnly))
@@ -415,16 +433,14 @@ pub fn assert_source_schema(
     Ok(())
 }
 
-/// MARF / Clarity-store infrastructure tables. They live in every MARF-backed
-/// source DB and are created by the squash engine (`MARF::squash_to_path`) or
-/// store init — not by a side-table copy — so the drift guards treat them as
-/// already handled.
+/// MARF / Clarity-store infrastructure tables handled by squash or store init
+/// instead of side-table copying.
 pub const MARF_INFRA_TABLES: &[&str] = &[
     "marf_data",
     "__fork_storage",
     "marf_squash_info",
     "marf_squashed_blocks",
-    "mined_blocks",
+    "mined_blocks", // legacy table removed by MARF schema 4, but may exist in older source DBs
     "block_extension_locks",
     "schema_version",
     "migrated_version",

@@ -43,7 +43,7 @@ use clarity::types::chainstate::{
 use clarity::types::PrivateKey;
 use clarity::util::hash::Sha256Sum;
 use clarity::util::secp256k1::MessageSignature;
-use clarity::vm::types::{QualifiedContractIdentifier, TupleData};
+use clarity::vm::types::{BoundedErrorString, QualifiedContractIdentifier, TupleData};
 use clarity::vm::{ClarityName, Value};
 use serde::{Deserialize, Serialize};
 use stacks_common::codec::{
@@ -53,7 +53,7 @@ use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum};
 
 use crate::stacks_common::types::PublicKey;
-use crate::v0::signer_state::{ReplayTransactionSet, SignerStateMachine};
+use crate::v0::signer_state::SignerStateMachine;
 use crate::{
     BlockProposal, MessageSlotID as MessageSlotIDTrait, SignerMessage as SignerMessageTrait,
     VERSION_STRING,
@@ -333,7 +333,15 @@ impl StacksMessageCodec for PeerInfo {
         let len_byte: u8 = read_next(fd)?;
         let mut bytes = vec![0u8; len_byte as usize];
         fd.read_exact(&mut bytes).map_err(CodecError::ReadError)?;
-        // must encode a valid string
+        // Must be a valid Clarity ASCII string: the mock signature hashes embed
+        // it as a `string-ascii` value, which would otherwise fail to construct.
+        if let Some(b) = bytes.iter().find(|b| {
+            !b.is_ascii_alphanumeric() && !b.is_ascii_punctuation() && !b.is_ascii_whitespace()
+        }) {
+            return Err(CodecError::DeserializeError(format!(
+                "Failed to parse server version name: invalid ASCII character {b:#04x}"
+            )));
+        }
         let server_version = String::from_utf8(bytes).map_err(|_e| {
             CodecError::DeserializeError(
                 "Failed to parse server version name: could not construct from utf8".to_string(),
@@ -586,7 +594,18 @@ pub enum StateMachineUpdateContent {
         burn_block_height: u64,
         /// The signer's view of who the current miner should be (and their tenure building info)
         current_miner: StateMachineUpdateMinerState,
-        /// The replay transactions
+        /// Legacy wire field, always empty.
+        ///
+        /// Transaction replay was removed, but `V1`/`V2` are defined wire versions and a signer
+        /// running an older binary still reads this vector off the wire — omitting it would make
+        /// it fail to decode the whole update. Retained so the variant matches the format it
+        /// declares. **Do not carry this field into a future content version**; a `V3` without it
+        /// is the proper way to retire it.
+        ///
+        /// Inbound updates never populate it: any transactions on the wire are skipped
+        /// undecoded (see `skip_legacy_replay_transactions`), and any persisted by an older
+        /// binary are skipped when deserializing.
+        #[serde(skip_deserializing)]
         replay_transactions: Vec<StacksTransaction>,
     },
     /// Version 2 is exactly the same as Version 1, but is used to indicate this signer is
@@ -598,7 +617,18 @@ pub enum StateMachineUpdateContent {
         burn_block_height: u64,
         /// The signer's view of who the current miner should be (and their tenure building info)
         current_miner: StateMachineUpdateMinerState,
-        /// The replay transactions
+        /// Legacy wire field, always empty.
+        ///
+        /// Transaction replay was removed, but `V1`/`V2` are defined wire versions and a signer
+        /// running an older binary still reads this vector off the wire — omitting it would make
+        /// it fail to decode the whole update. Retained so the variant matches the format it
+        /// declares. **Do not carry this field into a future content version**; a `V3` without it
+        /// is the proper way to retire it.
+        ///
+        /// Inbound updates never populate it: any transactions on the wire are skipped
+        /// undecoded (see `skip_legacy_replay_transactions`), and any persisted by an older
+        /// binary are skipped when deserializing.
+        #[serde(skip_deserializing)]
         replay_transactions: Vec<StacksTransaction>,
     },
 }
@@ -667,6 +697,21 @@ pub enum StateMachineUpdateMinerState {
     NoValidMiner,
 }
 impl StateMachineUpdate {
+    /// Decode a `StateMachineUpdate` from a raw `SignerMessage` StackerDB chunk.
+    ///
+    /// Returns `None` unless the chunk's type prefix is `StateMachineUpdate`. The prefix is
+    /// checked before anything else is decoded, so a chunk holding some other message type
+    /// (e.g. a `BlockPushed`) is never decoded as part of loading state machine updates. This
+    /// mirrors the lane check applied to live StackerDB events.
+    pub fn from_signer_message_chunk(chunk: &[u8]) -> Option<Self> {
+        let (&type_byte, rest) = chunk.split_first()?;
+        let payload_kind = SignerMessageTypePrefix::from_u8(type_byte)?;
+        if payload_kind.msg_id() != Some(MessageSlotID::StateMachineUpdate) {
+            return None;
+        }
+        Self::consensus_deserialize(&mut &rest[..]).ok()
+    }
+
     /// Create a `StateMachineUpdate` for **outbound** messages.
     ///
     /// The content version **must exactly match** the negotiated protocol version:
@@ -796,24 +841,6 @@ impl StacksMessageCodec for StateMachineUpdateMinerState {
 }
 
 impl StateMachineUpdateContent {
-    /// Get the replay transaction txids
-    pub fn replay_txids(&self) -> Vec<String> {
-        match self {
-            Self::V0 { .. } => Vec::new(),
-            Self::V1 {
-                replay_transactions,
-                ..
-            }
-            | Self::V2 {
-                replay_transactions,
-                ..
-            } => replay_transactions
-                .iter()
-                .map(|tx| tx.txid().to_string())
-                .collect(),
-        }
-    }
-
     /// Attempt to create a new state machine update content with the specified version
     pub fn new(
         version: u64,
@@ -830,13 +857,13 @@ impl StateMachineUpdateContent {
                 burn_block: state_machine.burn_block.clone(),
                 burn_block_height: state_machine.burn_block_height,
                 current_miner,
-                replay_transactions: state_machine.tx_replay_set.clone().unwrap_or_default(),
+                replay_transactions: vec![],
             },
             2 => StateMachineUpdateContent::V2 {
                 burn_block: state_machine.burn_block.clone(),
                 burn_block_height: state_machine.burn_block_height,
                 current_miner,
-                replay_transactions: state_machine.tx_replay_set.clone().unwrap_or_default(),
+                replay_transactions: vec![],
             },
             other => {
                 return Err(CodecError::DeserializeError(format!(
@@ -886,21 +913,6 @@ impl StateMachineUpdateContent {
         }
     }
 
-    /// Get the tx replay set
-    pub fn tx_replay_set(&self) -> ReplayTransactionSet {
-        match self {
-            Self::V0 { .. } => ReplayTransactionSet::none(),
-            Self::V1 {
-                replay_transactions,
-                ..
-            }
-            | Self::V2 {
-                replay_transactions,
-                ..
-            } => ReplayTransactionSet::new(replay_transactions.clone()),
-        }
-    }
-
     fn serialize<W: Write>(&self, fd: &mut W) -> Result<(), CodecError> {
         match self {
             Self::V0 {
@@ -932,6 +944,20 @@ impl StateMachineUpdateContent {
         }
         Ok(())
     }
+
+    /// Read past the legacy `replay_transactions` wire field without decoding it.
+    ///
+    /// Transaction replay was removed, so the transactions are never used and there is no reason
+    /// to decode, clone or persist them. Only the item count is read; the transactions are the
+    /// last field of the length-delimited content buffer, so the caller discards them with the
+    /// buffer. Updates from older signers that still send a replay set therefore remain readable.
+    fn skip_legacy_replay_transactions<R: Read>(fd: &mut R) -> Result<(), CodecError> {
+        let _num_replay_transactions: u32 = read_next(fd)?;
+        Ok(())
+    }
+
+    /// Deserialize the content from `fd`, which must hold exactly the content's
+    /// length-delimited buffer: any bytes after the fields read here are ignored.
     fn deserialize<R: Read>(fd: &mut R, version: u64) -> Result<Self, CodecError> {
         let burn_block = read_next(fd)?;
         let burn_block_height = read_next(fd)?;
@@ -943,21 +969,21 @@ impl StateMachineUpdateContent {
                 current_miner,
             }),
             1 => {
-                let replay_transactions = read_next(fd)?;
+                Self::skip_legacy_replay_transactions(fd)?;
                 Ok(Self::V1 {
                     burn_block,
                     burn_block_height,
                     current_miner,
-                    replay_transactions,
+                    replay_transactions: vec![],
                 })
             }
             2 => {
-                let replay_transactions = read_next(fd)?;
+                Self::skip_legacy_replay_transactions(fd)?;
                 Ok(Self::V2 {
                     burn_block,
                     burn_block_height,
                     current_miner,
-                    replay_transactions,
+                    replay_transactions: vec![],
                 })
             }
             other => Err(CodecError::DeserializeError(format!(
@@ -1072,6 +1098,8 @@ impl From<&RejectReason> for RejectReasonPrefix {
             RejectReason::NoSignerConsensus => RejectReasonPrefix::NoSignerConsensus,
             RejectReason::ConsensusHashMismatch { .. } => RejectReasonPrefix::ConsensusHashMismatch,
             RejectReason::ProblematicTransactions => RejectReasonPrefix::ProblematicTransactions,
+            RejectReason::ProposalTooOld => RejectReasonPrefix::ProposalTooOld,
+            RejectReason::RewardCycleRetired => RejectReasonPrefix::RewardCycleRetired,
             RejectReason::Unknown(_) => RejectReasonPrefix::Unknown,
             RejectReason::NotRejected => RejectReasonPrefix::NotRejected,
         }
@@ -1086,7 +1114,7 @@ pub enum RejectCode {
     /// No Sortition View to verify against
     NoSortitionView,
     /// The block was rejected due to connectivity issues with the signer
-    ConnectivityIssues(String),
+    ConnectivityIssues(BoundedErrorString),
     /// The block was rejected in a prior round
     RejectedInPriorRound,
     /// The block was rejected due to a mismatch with expected sortition view
@@ -1120,7 +1148,7 @@ pub enum RejectReason {
     /// No Sortition View to verify against
     NoSortitionView,
     /// The block was rejected due to connectivity issues with the signer
-    ConnectivityIssues(String),
+    ConnectivityIssues(BoundedErrorString),
     /// The block was rejected in a prior round
     RejectedInPriorRound,
     /// The block was rejected due to a mismatch with expected sortition view
@@ -1160,10 +1188,58 @@ pub enum RejectReason {
     /// The block marks one or more transactions as problematic, which signers
     /// do not yet allow
     ProblematicTransactions,
+    /// The block proposal's header timestamp is older than the signer's
+    /// configured `block_proposal_max_age_secs`
+    ProposalTooOld,
+    /// A sortition has occurred in a reward cycle later than this signer
+    /// set's, so this set is no longer responsible for the proposed
+    /// tenure and will not sign for it
+    RewardCycleRetired,
     /// The block was approved, no rejection details needed
     NotRejected,
     /// Handle unknown codes gracefully
     Unknown(u8),
+}
+
+impl RejectReason {
+    /// Is this rejection transient, i.e. caused by the signer's view lagging
+    /// behind the network (e.g. it has not yet processed a new burn block, or
+    /// received a parent block or its peers' state updates)?
+    ///
+    /// Such rejections usually resolve within seconds, and signers re-evaluate
+    /// the block when it is proposed again, so a miner should re-propose it
+    /// promptly rather than wait for the full rejection timeout.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            RejectReason::ValidationFailed(ValidateRejectCode::UnknownParent)
+            | RejectReason::ValidationFailed(ValidateRejectCode::NotFoundError)
+            | RejectReason::NoSortitionView
+            | RejectReason::ConnectivityIssues(_)
+            | RejectReason::ConsensusHashMismatch { .. }
+            | RejectReason::NoSignerConsensus => true,
+            RejectReason::ValidationFailed(_)
+            | RejectReason::RejectedInPriorRound
+            | RejectReason::SortitionViewMismatch
+            | RejectReason::TestingDirective
+            | RejectReason::ReorgNotAllowed
+            | RejectReason::InvalidBitvec
+            | RejectReason::PubkeyHashMismatch
+            | RejectReason::InvalidMiner
+            | RejectReason::NotLatestSortitionWinner
+            | RejectReason::InvalidParentBlock
+            | RejectReason::DuplicateBlockFound
+            // Resolves only once enough time has passed, not within seconds
+            | RejectReason::InvalidTenureExtend
+            | RejectReason::IrrecoverablePubkeyHash
+            | RejectReason::ProblematicTransactions
+            | RejectReason::ProposalTooOld
+            // Resolves only if a burnchain reorg orphans the later-cycle sortition
+            | RejectReason::RewardCycleRetired
+            | RejectReason::NotRejected
+            // A reason from a newer signer; its nature cannot be known
+            | RejectReason::Unknown(_) => false,
+        }
+    }
 }
 
 /// Enum representing the reject details type prefix
@@ -1210,6 +1286,12 @@ pub enum RejectReasonPrefix {
     /// The block marks one or more transactions as problematic, which signers
     /// do not yet allow
     ProblematicTransactions = 17,
+    /// The block proposal's header timestamp is older than the signer's
+    /// configured `block_proposal_max_age_secs`
+    ProposalTooOld = 18,
+    /// A sortition has occurred in a reward cycle later than this signer
+    /// set's, so this set is no longer responsible for the proposed tenure
+    RewardCycleRetired = 19,
     /// Unknown reject code, for forward compatibility
     Unknown = 254,
     /// The block was approved, no rejection details needed
@@ -1238,6 +1320,8 @@ impl RejectReasonPrefix {
             Self::NoSignerConsensus => 15,
             Self::ConsensusHashMismatch => 16,
             Self::ProblematicTransactions => 17,
+            Self::ProposalTooOld => 18,
+            Self::RewardCycleRetired => 19,
             Self::Unknown => 254,
             Self::NotRejected => 255,
         }
@@ -1265,6 +1349,8 @@ impl From<u8> for RejectReasonPrefix {
             15 => Self::NoSignerConsensus,
             16 => Self::ConsensusHashMismatch,
             17 => Self::ProblematicTransactions,
+            18 => Self::ProposalTooOld,
+            19 => Self::RewardCycleRetired,
             255 => Self::NotRejected,
             // For forward compatibility, all other values are unknown
             _ => Self::Unknown,
@@ -1491,7 +1577,7 @@ impl StacksMessageCodec for SignerMessageMetadata {
                 let server_version = String::from_utf8(server_version).map_err(|e| {
                     CodecError::DeserializeError(format!(
                         "Failed to decode server version: {:?}",
-                        &e
+                        e
                     ))
                 })?;
                 Ok(Self { server_version })
@@ -1705,7 +1791,7 @@ impl BlockAccepted {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlockRejection {
     /// The reason for the rejection
-    pub reason: String,
+    pub reason: BoundedErrorString,
     /// The reason code for the rejection
     pub reason_code: RejectCode,
     /// The signer signature hash of the block that was rejected
@@ -1730,13 +1816,9 @@ impl BlockRejection {
         full_extend_ts: u64,
         read_count_extend_ts: u64,
     ) -> Self {
-        let chain_id = if mainnet {
-            CHAIN_ID_MAINNET
-        } else {
-            CHAIN_ID_TESTNET
-        };
+        let chain_id = Self::chain_id_for_network(mainnet);
         let mut rejection = Self {
-            reason: reject_reason.to_string(),
+            reason: BoundedErrorString::from_display(&reject_reason),
             reason_code: (&reject_reason).into(),
             signer_signature_hash,
             signature: MessageSignature::empty(),
@@ -1755,6 +1837,16 @@ impl BlockRejection {
         rejection
     }
 
+    /// The chain id signers put in (and sign over in) rejections on a network. Rejections only
+    /// distinguish mainnet from testnet: a configured custom chain id is not used.
+    pub fn chain_id_for_network(mainnet: bool) -> u32 {
+        if mainnet {
+            CHAIN_ID_MAINNET
+        } else {
+            CHAIN_ID_TESTNET
+        }
+    }
+
     /// Create a new BlockRejection from a BlockValidateRejection
     pub fn from_validate_rejection(
         reject: BlockValidateReject,
@@ -1763,11 +1855,7 @@ impl BlockRejection {
         full_extend_ts: u64,
         read_count_extend_ts: u64,
     ) -> Self {
-        let chain_id = if mainnet {
-            CHAIN_ID_MAINNET
-        } else {
-            CHAIN_ID_TESTNET
-        };
+        let chain_id = Self::chain_id_for_network(mainnet);
         let reject_code = RejectCode::ValidationFailed(reject.reason_code);
         let response_data = BlockResponseData::new(
             full_extend_ts,
@@ -1843,8 +1931,9 @@ impl StacksMessageCodec for BlockRejection {
     fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<Self, CodecError> {
         let reason_bytes = read_next::<Vec<u8>, _>(fd)?;
         let reason = String::from_utf8(reason_bytes).map_err(|e| {
-            CodecError::DeserializeError(format!("Failed to decode reason string: {:?}", &e))
+            CodecError::DeserializeError(format!("Failed to decode reason string: {:?}", e))
         })?;
+        let reason = BoundedErrorString::from_display(&reason);
         let reason_code = read_next::<RejectCode, _>(fd)?;
         let signer_signature_hash = read_next::<Sha512Trunc256Sum, _>(fd)?;
         let chain_id = read_next::<u32, _>(fd)?;
@@ -1888,12 +1977,12 @@ impl StacksMessageCodec for RejectCode {
                 ValidateRejectCode::try_from(read_next::<u8, _>(fd)?).map_err(|e| {
                     CodecError::DeserializeError(format!(
                         "Failed to decode validation reject code: {:?}",
-                        &e
+                        e
                     ))
                 })?,
             ),
             RejectCodeTypePrefix::ConnectivityIssues => {
-                RejectCode::ConnectivityIssues("unspecified".to_string())
+                RejectCode::ConnectivityIssues("unspecified".into())
             }
             RejectCodeTypePrefix::RejectedInPriorRound => RejectCode::RejectedInPriorRound,
             RejectCodeTypePrefix::NoSortitionView => RejectCode::NoSortitionView,
@@ -1930,6 +2019,8 @@ impl StacksMessageCodec for RejectReason {
             | RejectReason::IrrecoverablePubkeyHash
             | RejectReason::NoSignerConsensus
             | RejectReason::ProblematicTransactions
+            | RejectReason::ProposalTooOld
+            | RejectReason::RewardCycleRetired
             | RejectReason::Unknown(_)
             | RejectReason::NotRejected => {
                 // No additional data to serialize / deserialize
@@ -1948,12 +2039,12 @@ impl StacksMessageCodec for RejectReason {
                 ValidateRejectCode::try_from(read_next::<u8, _>(fd)?).map_err(|e| {
                     CodecError::DeserializeError(format!(
                         "Failed to decode validation reject code: {:?}",
-                        &e
+                        e
                     ))
                 })?,
             ),
             RejectReasonPrefix::ConnectivityIssues => {
-                RejectReason::ConnectivityIssues("unspecified".to_string())
+                RejectReason::ConnectivityIssues("unspecified".into())
             }
             RejectReasonPrefix::RejectedInPriorRound => RejectReason::RejectedInPriorRound,
             RejectReasonPrefix::NoSortitionView => RejectReason::NoSortitionView,
@@ -1975,6 +2066,8 @@ impl StacksMessageCodec for RejectReason {
                 RejectReason::ConsensusHashMismatch { expected, actual }
             }
             RejectReasonPrefix::ProblematicTransactions => RejectReason::ProblematicTransactions,
+            RejectReasonPrefix::ProposalTooOld => RejectReason::ProposalTooOld,
+            RejectReasonPrefix::RewardCycleRetired => RejectReason::RewardCycleRetired,
             RejectReasonPrefix::Unknown => RejectReason::Unknown(type_prefix_byte),
             RejectReasonPrefix::NotRejected => RejectReason::NotRejected,
         };
@@ -2081,6 +2174,18 @@ impl std::fmt::Display for RejectReason {
                     "The block has an irrecoverable associated miner public key hash."
                 )
             }
+            RejectReason::ProposalTooOld => {
+                write!(
+                    f,
+                    "The block proposal's header timestamp is older than the maximum proposal age."
+                )
+            }
+            RejectReason::RewardCycleRetired => {
+                write!(
+                    f,
+                    "A sortition has occurred in a later reward cycle; this signer set no longer signs for the proposed tenure."
+                )
+            }
             RejectReason::NoSignerConsensus => {
                 write!(f, "No signer consensus reached.")
             }
@@ -2142,6 +2247,35 @@ mod test {
     }
 
     #[test]
+    fn transient_reject_reasons() {
+        let transient = [
+            RejectReason::ValidationFailed(ValidateRejectCode::UnknownParent),
+            RejectReason::ValidationFailed(ValidateRejectCode::NotFoundError),
+            RejectReason::NoSortitionView,
+            RejectReason::ConnectivityIssues("test".into()),
+            RejectReason::ConsensusHashMismatch {
+                expected: ConsensusHash([0x01; 20]),
+                actual: ConsensusHash([0x02; 20]),
+            },
+            RejectReason::NoSignerConsensus,
+        ];
+        let not_transient = [
+            RejectReason::ValidationFailed(ValidateRejectCode::InvalidBlock),
+            RejectReason::TestingDirective,
+            RejectReason::InvalidTenureExtend,
+            RejectReason::RewardCycleRetired,
+            RejectReason::NotRejected,
+            RejectReason::Unknown(0xff),
+        ];
+        for reason in &transient {
+            assert!(reason.is_transient(), "{reason:?}");
+        }
+        for reason in &not_transient {
+            assert!(!reason.is_transient(), "{reason:?}");
+        }
+    }
+
+    #[test]
     fn serde_reject_code() {
         let code = RejectCode::ValidationFailed(ValidateRejectCode::InvalidBlock);
         let serialized_code = code.serialize_to_vec();
@@ -2149,7 +2283,7 @@ mod test {
             .expect("Failed to deserialize RejectCode");
         assert_eq!(code, deserialized_code);
 
-        let code = RejectCode::ConnectivityIssues("unspecified".to_string());
+        let code = RejectCode::ConnectivityIssues("unspecified".into());
         let serialized_code = code.serialize_to_vec();
         let deserialized_code = read_next::<RejectCode, _>(&mut &serialized_code[..])
             .expect("Failed to deserialize RejectCode");
@@ -2173,7 +2307,7 @@ mod test {
 
         let rejection = BlockRejection::new(
             Sha512Trunc256Sum([1u8; 32]),
-            RejectReason::ConnectivityIssues("unspecified".to_string()),
+            RejectReason::ConnectivityIssues("unspecified".into()),
             &StacksPrivateKey::random(),
             thread_rng().gen_bool(0.5),
             thread_rng().next_u64(),
@@ -2331,6 +2465,24 @@ mod test {
     }
 
     #[test]
+    fn mock_proposal_rejects_non_ascii_server_version() {
+        let mut mock_proposal = random_mock_proposal();
+        mock_proposal.peer_info.server_version = "0.0.0".to_string();
+        let mut bytes = mock_proposal.serialize_to_vec();
+        // Replace one byte of the server version with a control character,
+        // which is valid UTF-8 but not a Clarity `string-ascii` character.
+        let version_offset = 8 + 20 + 32 + 8 + 1;
+        assert_eq!(bytes[version_offset], b'0');
+        bytes[version_offset] = 0x0e;
+        let err = read_next::<MockProposal, _>(&mut &bytes[..])
+            .expect_err("a non-ASCII server version must not decode");
+        assert!(
+            matches!(err, CodecError::DeserializeError(ref msg) if msg.contains("invalid ASCII")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn serde_mock_proposal() {
         let mut mock_signature = random_mock_proposal();
         mock_signature.sign(&StacksPrivateKey::random()).unwrap();
@@ -2388,7 +2540,7 @@ mod test {
             block_rejected,
             SignerMessage::BlockResponse(BlockResponse::Rejected(BlockRejection {
                 reason_code: RejectCode::ValidationFailed(ValidateRejectCode::NoSuchTenure),
-                reason: "Block is not a tenure-start block, and has an unrecognized tenure consensus hash".to_string(),
+                reason: "Block is not a tenure-start block, and has an unrecognized tenure consensus hash".into(),
                 signer_signature_hash: Sha512Trunc256Sum::from_hex("91f95f84b7045f7dce7757052caa986ef042cb58f7df5031a3b5b5d0e3dda63e").unwrap(),
                 chain_id: CHAIN_ID_TESTNET,
                 signature: MessageSignature::from_hex("006fb349212e1a1af1a3c712878d5159b5ec14636adb6f70be00a6da4ad4f88a9934d8a9abb229620dd8e0f225d63401e36c64817fb29e6c05591dcbe95c512df3").unwrap(),
@@ -2426,7 +2578,7 @@ mod test {
             block_rejected,
             SignerMessage::BlockResponse(BlockResponse::Rejected(BlockRejection {
                 reason_code: RejectCode::ValidationFailed(ValidateRejectCode::NoSuchTenure),
-                reason: "Block is not a tenure-start block, and has an unrecognized tenure consensus hash".to_string(),
+                reason: "Block is not a tenure-start block, and has an unrecognized tenure consensus hash".into(),
                 signer_signature_hash: Sha512Trunc256Sum::from_hex("91f95f84b7045f7dce7757052caa986ef042cb58f7df5031a3b5b5d0e3dda63e").unwrap(),
                 chain_id: CHAIN_ID_TESTNET,
                 signature: MessageSignature::from_hex("006fb349212e1a1af1a3c712878d5159b5ec14636adb6f70be00a6da4ad4f88a9934d8a9abb229620dd8e0f225d63401e36c64817fb29e6c05591dcbe95c512df3").unwrap(),
@@ -2527,6 +2679,36 @@ mod test {
             fd.write_all(&inner_bytes).map_err(CodecError::WriteError)?;
             Ok(())
         }
+    }
+
+    #[test]
+    fn reward_cycle_retired_round_trips() {
+        // Pin the wire code: it is part of the protocol as soon as a signer sends one.
+        assert_eq!(
+            RejectReasonPrefix::from(&RejectReason::RewardCycleRetired).to_u8(),
+            19
+        );
+
+        let mut bytes = vec![];
+        RejectReason::RewardCycleRetired
+            .consensus_serialize(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, vec![19], "the reason carries no additional data");
+        assert_eq!(
+            read_next::<RejectReason, _>(&mut bytes.as_slice()).unwrap(),
+            RejectReason::RewardCycleRetired
+        );
+
+        // A peer that predates the variant reads the byte through this arm rather than
+        // failing to parse the rejection, which is what makes adding one safe.
+        assert_eq!(
+            RejectReasonPrefix::from(19u8),
+            RejectReasonPrefix::RewardCycleRetired
+        );
+        assert_eq!(
+            read_next::<RejectReason, _>(&mut [20u8].as_slice()).unwrap(),
+            RejectReason::Unknown(20)
+        );
     }
 
     #[test]
@@ -2637,6 +2819,109 @@ mod test {
         assert_eq!(
             accepted.response_data.tenure_extend_read_count_timestamp,
             u64::MAX
+        );
+    }
+
+    /// Block responses as serialized by stacks-signer 3.3.0.0.5 (`BlockResponseData` version 4,
+    /// before `failed_txid` was added).
+    const V3_3_0_0_5_BLOCK_ACCEPTED_HEX: &str = "01006dc06b8ae0cb304b1808731bd5e77b0befec809f6e02379623ee0f00c10b6586f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f300000017737461636b732d7369676e657220332e332e302e302e3504000000110000000000000801ff00000000000013c2";
+    const V3_3_0_0_5_BLOCK_REJECTED_HEX: &str = "010100000017426c6f636b2076616c69646174696f6e206661696c656400015de625f37ad6824e38d7677bf0bcab391c6001f2485341cb07fb55536b86946e800000003f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f00000017737461636b732d7369676e657220332e332e302e302e3504000000120000000000000801000100000000000013c2";
+
+    /// Block responses as serialized by the current signer (`BlockResponseData` version 5).
+    /// These exact bytes were verified to deserialize with stacks-signer 3.3.0.0.5, which keeps
+    /// the `failed_txid` encoding in `unknown_bytes` and re-serializes them byte-for-byte.
+    /// Any change to these bytes must be re-verified for compatibility with older signers.
+    const V5_BLOCK_ACCEPTED_HEX: &str = "01006dc06b8ae0cb304b1808731bd5e77b0befec809f6e02379623ee0f00c10b6586f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f300000015737461636b732d7369676e65722063757272656e7405000000120000000000000801ff00000000000013c200";
+    const V5_BLOCK_REJECTED_HEX: &str = "010100000017426c6f636b2076616c69646174696f6e206661696c656400015de625f37ad6824e38d7677bf0bcab391c6001f2485341cb07fb55536b86946e800000003f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f00000015737461636b732d7369676e65722063757272656e7405000000330000000000000801000100000000000013c201abababababababababababababababababababababababababababababababab";
+
+    fn compat_block_accepted(
+        server_version: &str,
+        response_data: BlockResponseData,
+    ) -> SignerMessage {
+        SignerMessage::BlockResponse(BlockResponse::Accepted(BlockAccepted {
+            signer_signature_hash: Sha512Trunc256Sum::from_data(&[0, 1, 2, 3]),
+            signature: MessageSignature([0xf3; 65]),
+            metadata: SignerMessageMetadata {
+                server_version: server_version.into(),
+            },
+            response_data,
+        }))
+    }
+
+    fn compat_block_rejected(
+        server_version: &str,
+        response_data: BlockResponseData,
+    ) -> SignerMessage {
+        SignerMessage::BlockResponse(BlockResponse::Rejected(BlockRejection {
+            reason: "Block validation failed".into(),
+            reason_code: RejectCode::ValidationFailed(ValidateRejectCode::BadTransaction),
+            signer_signature_hash: Sha512Trunc256Sum::from_data(&[4, 5, 6, 7]),
+            signature: MessageSignature([0x3f; 65]),
+            chain_id: CHAIN_ID_TESTNET,
+            metadata: SignerMessageMetadata {
+                server_version: server_version.into(),
+            },
+            response_data,
+        }))
+    }
+
+    #[test]
+    fn deserialize_v3_3_0_0_5_block_responses() {
+        let v4_response_data = |reject_reason| BlockResponseData {
+            version: 4,
+            ..BlockResponseData::new(2049, reject_reason, 5058, None)
+        };
+
+        let bytes = hex_bytes(V3_3_0_0_5_BLOCK_ACCEPTED_HEX).unwrap();
+        let accepted = read_next::<SignerMessage, _>(&mut &bytes[..]).unwrap();
+        assert_eq!(
+            accepted,
+            compat_block_accepted(
+                "stacks-signer 3.3.0.0.5",
+                v4_response_data(RejectReason::NotRejected)
+            )
+        );
+
+        let bytes = hex_bytes(V3_3_0_0_5_BLOCK_REJECTED_HEX).unwrap();
+        let rejected = read_next::<SignerMessage, _>(&mut &bytes[..]).unwrap();
+        assert_eq!(
+            rejected,
+            compat_block_rejected(
+                "stacks-signer 3.3.0.0.5",
+                v4_response_data(RejectReason::ValidationFailed(
+                    ValidateRejectCode::BadTransaction
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn block_responses_serialize_in_v3_3_0_0_5_compatible_format() {
+        let accepted = compat_block_accepted(
+            "stacks-signer current",
+            BlockResponseData::new(2049, RejectReason::NotRejected, 5058, None),
+        );
+        let bytes = accepted.serialize_to_vec();
+        assert_eq!(bytes, hex_bytes(V5_BLOCK_ACCEPTED_HEX).unwrap());
+        assert_eq!(
+            read_next::<SignerMessage, _>(&mut &bytes[..]).unwrap(),
+            accepted
+        );
+
+        let rejected = compat_block_rejected(
+            "stacks-signer current",
+            BlockResponseData::new(
+                2049,
+                RejectReason::ValidationFailed(ValidateRejectCode::BadTransaction),
+                5058,
+                Some(Txid([0xab; 32])),
+            ),
+        );
+        let bytes = rejected.serialize_to_vec();
+        assert_eq!(bytes, hex_bytes(V5_BLOCK_REJECTED_HEX).unwrap());
+        assert_eq!(
+            read_next::<SignerMessage, _>(&mut &bytes[..]).unwrap(),
+            rejected
         );
     }
 
@@ -2960,7 +3245,7 @@ mod test {
             (
                 SignerMessage::BlockResponse(BlockResponse::Rejected(BlockRejection {
                     reason_code: RejectCode::ValidationFailed(ValidateRejectCode::NoSuchTenure),
-                    reason: "Block is not a tenure-start block, and has an unrecognized tenure consensus hash".to_string(),
+                    reason: "Block is not a tenure-start block, and has an unrecognized tenure consensus hash".into(),
                     signer_signature_hash: Sha512Trunc256Sum::from_hex("91f95f84b7045f7dce7757052caa986ef042cb58f7df5031a3b5b5d0e3dda63e").unwrap(),
                     chain_id: CHAIN_ID_TESTNET,
                     signature: MessageSignature::from_hex("006fb349212e1a1af1a3c712878d5159b5ec14636adb6f70be00a6da4ad4f88a9934d8a9abb229620dd8e0f225d63401e36c64817fb29e6c05591dcbe95c512df3").unwrap(),

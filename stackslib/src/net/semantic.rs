@@ -29,7 +29,7 @@ use crate::chainstate::stacks::{
 };
 use crate::core::mempool::{MemPoolDB, MemPoolSyncData};
 use crate::net::atlas::{AtlasDB, Attachment, AttachmentPage};
-use crate::net::{NeighborKey, NetworkResult};
+use crate::net::{Downloaded, NeighborKey, NetworkResult};
 use crate::util_lib::db::{DBConn, Error as DbError};
 
 const CONSENSUS_HASH_BYTES: usize = 20;
@@ -217,12 +217,18 @@ impl RelayerIngressAdapter {
                     .or_insert(block);
             }
             DecodedNetworkObject::AnchoredBlock(consensus_hash, block) => {
-                result.blocks.push((consensus_hash, block, 0));
+                result.blocks.push(Downloaded {
+                    consensus_hash,
+                    data: block,
+                    download_time_secs: 0,
+                });
             }
             DecodedNetworkObject::ConfirmedMicroblocks(consensus_hash, stream) => {
-                result
-                    .confirmed_microblocks
-                    .push((consensus_hash, stream, 0));
+                result.confirmed_microblocks.push(Downloaded {
+                    consensus_hash,
+                    data: stream,
+                    download_time_secs: 0,
+                });
             }
             DecodedNetworkObject::Attachment(attachment) => {
                 return Ok(RelayerIngressOutcome::Attachment(attachment));

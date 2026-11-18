@@ -549,10 +549,10 @@ fn publish_signer_round_metrics(round: &Libp2pSignerRound) {
             // current/previous signer set is safe to retain at zero and gives
             // every scrape an explicit revocation.
             prometheus::MINER_SIGNER_VOTE_WEIGHT_GAUGE
-                .with_label_values(&[key, decision])
+                .with_label_values(&[key.as_str(), *decision])
                 .set(0);
             prometheus::MINER_SIGNER_VOTE_LATENCY_SECONDS_GAUGE
-                .with_label_values(&[key, decision])
+                .with_label_values(&[key.as_str(), *decision])
                 .set(0.0);
         }
         for vote in &round.votes {
@@ -687,7 +687,7 @@ fn update_libp2p_diagnostic_metrics(snapshot: &serde_json::Value) {
             if delta > 0 {
                 prometheus::LIBP2P_EVENTS_COUNTER
                     .with_label_values(&[event])
-                    .inc_by(i64::try_from(delta).unwrap_or(i64::MAX));
+                    .inc_by(delta);
             }
         }
         for &(field, reason) in &[
@@ -709,7 +709,7 @@ fn update_libp2p_diagnostic_metrics(snapshot: &serde_json::Value) {
                 current
             };
             if delta > 0 {
-                counter.inc_by(i64::try_from(delta).unwrap_or(i64::MAX));
+                counter.inc_by(delta);
             }
         }
     }
@@ -797,7 +797,7 @@ pub fn set_last_execution_cost_observed(
         prometheus::LAST_BLOCK_READ_COUNT
             .set(execution_cost.read_count as f64 / block_limit.read_count as f64);
         prometheus::LAST_BLOCK_WRITE_COUNT
-            .set(execution_cost.write_count as f64 / block_limit.read_count as f64);
+            .set(execution_cost.write_count as f64 / block_limit.write_count as f64);
         prometheus::LAST_BLOCK_READ_LENGTH
             .set(execution_cost.read_length as f64 / block_limit.read_length as f64);
         prometheus::LAST_BLOCK_WRITE_LENGTH
@@ -827,7 +827,7 @@ pub fn set_last_mined_execution_cost_observed(
         prometheus::LAST_MINED_BLOCK_READ_COUNT
             .set(execution_cost.read_count as f64 / block_limit.read_count as f64);
         prometheus::LAST_MINED_BLOCK_WRITE_COUNT
-            .set(execution_cost.write_count as f64 / block_limit.read_count as f64);
+            .set(execution_cost.write_count as f64 / block_limit.write_count as f64);
         prometheus::LAST_MINED_BLOCK_READ_LENGTH
             .set(execution_cost.read_length as f64 / block_limit.read_length as f64);
         prometheus::LAST_MINED_BLOCK_WRITE_LENGTH
@@ -885,7 +885,7 @@ fn txid_tracking_db(chainstate_root_path: &str) -> Result<DBConn, DatabaseError>
     let db_path = path.to_str().ok_or_else(|| DatabaseError::ParseError)?;
 
     let mut create_flag = false;
-    let open_flags = if fs::metadata(&db_path).is_err() {
+    let open_flags = if fs::metadata(db_path).is_err() {
         // need to create
         create_flag = true;
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
@@ -894,7 +894,7 @@ fn txid_tracking_db(chainstate_root_path: &str) -> Result<DBConn, DatabaseError>
         OpenFlags::SQLITE_OPEN_READ_WRITE
     };
 
-    let conn = sqlite_open(&db_path, open_flags, false)?;
+    let conn = sqlite_open(db_path, open_flags, false)?;
 
     if create_flag {
         conn.execute(
@@ -910,7 +910,7 @@ fn txid_tracking_db_contains(conn: &DBConn, txid: &Txid) -> Result<bool, Databas
     let contains = conn
         .query_row(
             "SELECT 1 FROM processed_txids WHERE txid = ?",
-            &[txid],
+            [txid],
             |_row| Ok(true),
         )
         .optional()?
@@ -1066,8 +1066,7 @@ fn convert_uint256_to_f64_percentage(value: Uint256, precision_points: u32) -> f
     .low_u64() as i64;
     let divisor = i64::pow(base as i64, precision_points);
 
-    let result = intermediate_result as f64 / divisor as f64;
-    result
+    intermediate_result as f64 / divisor as f64
 }
 
 #[cfg(test)]

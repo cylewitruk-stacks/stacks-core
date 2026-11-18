@@ -48,6 +48,7 @@ use stacks_common::types::chainstate::{
 };
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum, bytes_to_hex};
+use stacks_marf::ClarityMarfTrieId;
 use stackslib::burnchains::{PoxConstants, Txid};
 use stackslib::chainstate::stacks::boot::{
     BOOT_CODE_BNS, BOOT_CODE_COST_VOTING_MAINNET, BOOT_CODE_COST_VOTING_TESTNET, BOOT_CODE_COSTS,
@@ -55,11 +56,10 @@ use stackslib::chainstate::stacks::boot::{
     BOOT_CODE_GENESIS, BOOT_CODE_LOCKUP, BOOT_CODE_POX_MAINNET, BOOT_CODE_POX_TESTNET,
     POX_2_MAINNET_CODE, POX_2_TESTNET_CODE,
 };
-use stackslib::chainstate::stacks::index::ClarityMarfTrieId;
 use stackslib::clarity_vm::clarity::{ClarityMarfStore, ClarityMarfStoreTransaction};
 use stackslib::clarity_vm::database::MemoryBackingStore;
 use stackslib::clarity_vm::database::marf::{MarfedKV, PersistentWritableMarfStore};
-use stackslib::core::{BLOCK_LIMIT_MAINNET_205, HELIUM_BLOCK_LIMIT_20, StacksEpochId};
+use stackslib::core::{BLOCK_LIMIT_MAINNET_205, BLOCK_LIMIT_REGTEST_20, StacksEpochId};
 use stackslib::util_lib::boot::{boot_code_addr, boot_code_id};
 use stackslib::util_lib::db::{FromColumn, sqlite_open};
 
@@ -119,27 +119,45 @@ pub fn friendly_expect_opt<A>(input: Option<A>, msg: &str) -> A {
 
 /// Read text content from a file path or stdin if path is "-"
 pub fn read_file_or_stdin(path: &str) -> String {
-    if path == "-" {
-        let mut buffer = String::new();
-        io::stdin()
-            .read_to_string(&mut buffer)
-            .expect("Error reading from stdin");
-        buffer
-    } else {
-        fs::read_to_string(path).unwrap_or_else(|e| panic!("Error reading file {path}: {e}"))
-    }
+    friendly_expect(try_read_file_or_stdin(path), &read_error_message(path))
 }
 
 /// Read binary content from a file path or stdin if path is "-"
 pub fn read_file_or_stdin_bytes(path: &str) -> Vec<u8> {
+    friendly_expect(
+        try_read_file_or_stdin_bytes(path),
+        &read_error_message(path),
+    )
+}
+
+/// Build the error message shown when a read of `path` fails.
+fn read_error_message(path: &str) -> String {
+    if path == "-" {
+        "Error reading from stdin".to_string()
+    } else {
+        format!("Error reading file {path}")
+    }
+}
+
+/// Read UTF-8 content from `path`, or from stdin if `path` is "-".
+fn try_read_file_or_stdin(path: &str) -> io::Result<String> {
+    if path == "-" {
+        let mut buffer = String::new();
+        io::stdin().read_to_string(&mut buffer)?;
+        Ok(buffer)
+    } else {
+        fs::read_to_string(path)
+    }
+}
+
+/// Read raw bytes from `path`, or from stdin if `path` is "-".
+fn try_read_file_or_stdin_bytes(path: &str) -> io::Result<Vec<u8>> {
     if path == "-" {
         let mut buffer = vec![];
-        io::stdin()
-            .read_to_end(&mut buffer)
-            .expect("Error reading from stdin");
-        buffer
+        io::stdin().read_to_end(&mut buffer)?;
+        Ok(buffer)
     } else {
-        fs::read(path).unwrap_or_else(|e| panic!("Error reading file {path}: {e}"))
+        fs::read(path)
     }
 }
 
@@ -267,7 +285,7 @@ fn run_analysis<C: ClarityStorage>(
         if mainnet {
             BLOCK_LIMIT_MAINNET_205
         } else {
-            HELIUM_BLOCK_LIMIT_20
+            BLOCK_LIMIT_REGTEST_20
         },
         &mut marf_kv.get_clarity_db(header_db, &NULL_BURN_STATE_DB),
         epoch,
@@ -450,7 +468,7 @@ where
         if mainnet {
             BLOCK_LIMIT_MAINNET_205
         } else {
-            HELIUM_BLOCK_LIMIT_20
+            BLOCK_LIMIT_REGTEST_20
         },
         &mut db,
         epoch,
@@ -861,10 +879,10 @@ fn install_boot_code<C: ClarityStorage>(
     };
 
     let params = vec![
-        SymbolicExpression::atom_value(Value::UInt(0)), // first burnchain block height
-        SymbolicExpression::atom_value(Value::UInt(pox_params.prepare_length as u128)),
-        SymbolicExpression::atom_value(Value::UInt(pox_params.reward_cycle_length as u128)),
-        SymbolicExpression::atom_value(Value::UInt(pox_params.pox_rejection_fraction as u128)),
+        Value::UInt(0), // first burnchain block height
+        Value::UInt(pox_params.prepare_length as u128),
+        Value::UInt(pox_params.reward_cycle_length as u128),
+        Value::UInt(pox_params.pox_rejection_fraction as u128),
     ];
 
     let db = marf.get_clarity_db(header_db, &NULL_BURN_STATE_DB);
@@ -875,7 +893,7 @@ fn install_boot_code<C: ClarityStorage>(
             None,
             pox_contract,
             "set-burnchain-parameters",
-            params.as_slice(),
+            params,
         )
         .unwrap();
 }
@@ -962,7 +980,7 @@ pub fn execute_generate_address() -> (i32, Option<serde_json::Value>) {
     // Version = 22
     let addr = friendly_expect(c32_address(22, &random_bytes), "Failed to generate address");
 
-    (0, Some(json!({ "address": format!("{addr}") })))
+    (0, Some(json!({ "address": addr.to_string() })))
 }
 
 /// Typecheck a potential contract definition
@@ -1514,7 +1532,7 @@ pub fn execute_execute(
     contract_identifier: &QualifiedContractIdentifier,
     tx_name: &str,
     sender: PrincipalData,
-    arguments: &[SymbolicExpression],
+    arguments: Vec<Value>,
     costs: bool,
     assets: bool,
     epoch: StacksEpochId,
@@ -1887,13 +1905,13 @@ mod test {
         )
         .expect("Failed to parse argument")
         .expect("Failed to get value from argument");
-        let arguments = vec![SymbolicExpression::atom_value(arg_parsed)];
+        let arguments = vec![arg_parsed];
         let (exit, result) = execute_execute(
             &db_name,
             &contract_id,
             "mint!",
             sender,
-            &arguments,
+            arguments,
             false,
             false,
             DEFAULT_CLI_EPOCH,
@@ -2491,5 +2509,33 @@ mod test {
             result_json
         );
         assert!(result_json["error"]["runtime"] != json!(null));
+    }
+
+    #[test]
+    fn test_read_missing_file_is_an_error() {
+        let missing = "path/to/unexistent_contract.clar";
+
+        assert_eq!(
+            try_read_file_or_stdin(missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            try_read_file_or_stdin_bytes(missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn test_read_file_returns_its_contents() {
+        let path = format!(
+            "/tmp/clarity_cli_read_file_{}.clar",
+            rand::thread_rng().r#gen::<i32>()
+        );
+        fs::write(&path, "(ok u1)").unwrap();
+
+        assert_eq!(try_read_file_or_stdin(&path).unwrap(), "(ok u1)");
+        assert_eq!(try_read_file_or_stdin_bytes(&path).unwrap(), b"(ok u1)");
+
+        fs::remove_file(&path).unwrap();
     }
 }

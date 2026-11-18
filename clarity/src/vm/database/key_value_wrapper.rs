@@ -53,7 +53,7 @@ fn rollback_check_pre_bottom_commit<T>(
 where
     T: Eq + Hash + Clone,
 {
-    for (_, edit_history) in lookup_map.iter_mut() {
+    for edit_history in lookup_map.values_mut() {
         edit_history.reverse();
     }
 
@@ -90,7 +90,7 @@ fn rollback_check_pre_bottom_commit<T>(
 where
     T: Eq + Hash + Clone,
 {
-    for (_, edit_history) in lookup_map.iter_mut() {
+    for edit_history in lookup_map.values_mut() {
         edit_history.reverse();
     }
     for (key, value) in edits.iter() {
@@ -226,8 +226,11 @@ impl<'a> RollbackWrapper<'a> {
         }
     }
 
-    pub fn get_cc_special_cases_handler(&self) -> Option<SpecialCaseHandler> {
-        self.store.get_cc_special_cases_handler()
+    pub fn get_cc_special_cases_handler(
+        &self,
+        contract: &QualifiedContractIdentifier,
+    ) -> Option<SpecialCaseHandler> {
+        self.store.get_cc_special_cases_handler(contract)
     }
 
     pub fn nest(&mut self) {

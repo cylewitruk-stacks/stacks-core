@@ -454,7 +454,7 @@ pub fn spawn(config: &Config, burnchain: &Burnchain) -> io::Result<NetworkServic
             hello,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
-        format!("libp2p:{}", config.node.name),
+        format!("libp2p:{}", config.node.p2p_bind),
     )?;
     let generic_stackerdb_state = config.node.generic_stackerdb_replication_state();
     stacks::monitoring::set_libp2p_network_context(serde_json::json!({

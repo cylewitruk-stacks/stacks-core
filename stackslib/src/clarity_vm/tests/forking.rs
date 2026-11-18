@@ -17,7 +17,7 @@ use clarity::vm::analysis::errors::RuntimeCheckErrorKind;
 use clarity::vm::contexts::OwnedEnvironment;
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError};
 use clarity::vm::test_util::{
-    execute, is_committed, is_err_code, symbols_from_values, TEST_BURN_STATE_DB, TEST_HEADER_DB,
+    execute, is_committed, is_err_code, TEST_BURN_STATE_DB, TEST_HEADER_DB,
 };
 use clarity::vm::tests::test_clarity_versions;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, Value};
@@ -25,8 +25,8 @@ use clarity::vm::version::ClarityVersion;
 use clarity::vm::{ContractContext, ContractName};
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
 use stacks_common::types::StacksEpochId;
+use stacks_marf::ClarityMarfTrieId;
 
-use crate::chainstate::stacks::index::ClarityMarfTrieId;
 use crate::clarity_vm::clarity::{ClarityMarfStore, ClarityMarfStoreTransaction};
 use crate::clarity_vm::database::marf::MarfedKV;
 
@@ -90,7 +90,7 @@ fn test_at_block_mutations(#[case] version: ClarityVersion, #[case] epoch: Stack
         }
 
         owned_env
-            .execute_transaction(p1, None, c, to_exec, &[])
+            .execute_transaction(p1, None, c, to_exec, vec![])
             .map(|(x, _, _)| x)
     }
 
@@ -187,7 +187,7 @@ fn test_at_block_good(#[case] version: ClarityVersion, #[case] epoch: StacksEpoc
         }
 
         owned_env
-            .execute_transaction(p1, None, c, to_exec, &[])
+            .execute_transaction(p1, None, c, to_exec, vec![])
             .map(|(x, _, _)| x)
     }
 
@@ -260,10 +260,10 @@ fn test_at_block_missing_defines(#[case] version: ClarityVersion, #[case] epoch:
             ";
 
         eprintln!("Initializing contract...");
-        let e = owned_env
+
+        owned_env
             .initialize_contract(c_b, contract, None)
-            .unwrap_err();
-        e
+            .unwrap_err()
     }
 
     with_separate_forks_environment(
@@ -421,7 +421,7 @@ fn branched_execution(
             None,
             contract_identifier,
             "destroy",
-            &symbols_from_values(vec![Value::UInt(10)]),
+            vec![Value::UInt(10)],
         )
         .unwrap();
 

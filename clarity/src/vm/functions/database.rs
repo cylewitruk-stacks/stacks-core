@@ -16,6 +16,7 @@
 
 use clarity_types::ClarityName;
 use clarity_types::types::CallableData;
+use stacks_common::bounded_format;
 use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
@@ -23,7 +24,9 @@ use stacks_common::types::chainstate::StacksBlockId;
 use crate::vm::callables::DefineType;
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
-use crate::vm::costs::{CostTracker, MemoryConsumer, constants as cost_constants, runtime_cost};
+use crate::vm::costs::{
+    CostOverflowingMath, CostTracker, MemoryConsumer, constants as cost_constants, runtime_cost,
+};
 use crate::vm::errors::{
     RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError, check_argument_count,
     check_arguments_at_least,
@@ -75,19 +78,13 @@ pub fn special_contract_call(
 
     let function_name = args[1]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
     let rest_args_slice = &args[2..];
     let rest_args_len = rest_args_slice.len();
     let mut rest_args = Vec::with_capacity(rest_args_len);
-    let mut rest_args_sizes = Vec::with_capacity(rest_args_len);
     for arg in rest_args_slice.iter() {
         let evaluated_arg = eval(arg, exec_state, invoke_ctx, context)?;
-        rest_args_sizes.push(evaluated_arg.as_ref().size()?.into());
-        rest_args.push(SymbolicExpression::atom_value(
-            evaluated_arg.clone_with_cost(exec_state)?,
-        ));
+        rest_args.push(evaluated_arg.clone_with_cost(exec_state)?);
     }
 
     let (contract_identifier, type_returns_constraint) = match &args[0].expr {
@@ -163,31 +160,43 @@ pub fn special_contract_call(
                     if contract_to_check.is_explicitly_implementing_trait(&trait_identifier) {
                         (contract_identifier.clone(), None)
                     } else {
-                        let trait_name = trait_identifier.name.to_string();
-
-                        // Retrieve, from the trait definition, the expected method signature
-                        let contract_defining_trait = exec_state
-                            .global_context
-                            .database
-                            .get_contract(&trait_identifier.contract_identifier)
-                            .map_err(|_e| {
-                                RuntimeCheckErrorKind::NoSuchContract(
-                                    trait_identifier.contract_identifier.to_string(),
-                                )
-                            })?;
+                        // Load the contract that defines the trait. From Epoch 4.1, a trait
+                        // defined by the calling contract is read from its own context, which
+                        // is not yet stored while that contract deploys.
+                        let loaded_contract;
+                        let contract_defining_trait =
+                            if exec_state.epoch().supports_local_trait_lookup()
+                                && trait_identifier.contract_identifier
+                                    == invoke_ctx.contract_context.contract_identifier
+                            {
+                                invoke_ctx.contract_context
+                            } else {
+                                loaded_contract = exec_state
+                                    .global_context
+                                    .database
+                                    .get_contract(&trait_identifier.contract_identifier)
+                                    .map_err(|_e| {
+                                        RuntimeCheckErrorKind::NoSuchContract(
+                                            trait_identifier.contract_identifier.to_string(),
+                                        )
+                                    })?;
+                                &*loaded_contract
+                            };
 
                         // Retrieve the function that will be invoked
                         let function_to_check = contract_to_check
                             .lookup_function(function_name)
-                            .ok_or(RuntimeCheckErrorKind::BadTraitImplementation(
-                                trait_name.clone(),
-                                function_name.to_string(),
-                            ))?;
+                            .ok_or_else(|| {
+                                RuntimeCheckErrorKind::BadTraitImplementation(
+                                    trait_identifier.name.to_string(),
+                                    function_name.to_string(),
+                                )
+                            })?;
 
                         // Check read/write compatibility
                         if exec_state.global_context.is_read_only() {
                             return Err(RuntimeCheckErrorKind::Unreachable(
-                                "Trait based contract call in read-only".to_string(),
+                                "Trait based contract call in read-only".into(),
                             )
                             .into());
                         }
@@ -201,24 +210,13 @@ pub fn special_contract_call(
                             .into());
                         }
 
-                        // If this check succeeds, the subsequent trait reference and method checks cannot fail
-                        function_to_check.check_trait_expectations(
+                        let expected_sig = function_to_check.check_trait_expectations(
                             exec_state.epoch(),
-                            &contract_defining_trait,
+                            contract_defining_trait,
                             &trait_identifier,
                         )?;
-
-                        // Retrieve the expected method signature
-                        let constraining_trait = contract_defining_trait
-                            .lookup_trait_definition(&trait_name)
-                            .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
-                                "Trait reference unknown: {trait_name}"
-                            )))?;
-                        let expected_sig = constraining_trait.get(function_name).ok_or(
-                            RuntimeCheckErrorKind::Unreachable(format!(
-                                "Trait method unknown: {trait_name}.{function_name}"
-                            )),
-                        )?;
+                        // Own the return type so the trait-defining contract is released here
+                        // instead of staying loaded through the nested call.
                         (
                             contract_identifier.clone(),
                             Some(expected_sig.returns.clone()),
@@ -238,34 +236,18 @@ pub fn special_contract_call(
         .into();
 
     let nested_ctx = invoke_ctx.with_caller(contract_principal);
-    let result = if exec_state.short_circuit_contract_call(
+    let result = exec_state.execute_contract(
+        &nested_ctx,
         &contract_identifier,
         function_name,
-        &rest_args_sizes,
-    )? {
-        exec_state.run_free(&nested_ctx, |free_exec_state, nested_ctx| {
-            free_exec_state.execute_contract(
-                nested_ctx,
-                &contract_identifier,
-                function_name,
-                &rest_args,
-                false,
-            )
-        })
-    } else {
-        exec_state.execute_contract(
-            &nested_ctx,
-            &contract_identifier,
-            function_name,
-            &rest_args,
-            false,
-        )
-    }?;
+        rest_args,
+        false,
+    )?;
 
     // sanitize contract-call outputs in epochs >= 2.4
     let result_type = TypeSignature::type_of(&result)?;
     let (result, _) = Value::sanitize_value(exec_state.epoch(), &result_type, result)
-        .ok_or_else(|| RuntimeCheckErrorKind::CouldNotDetermineType)?;
+        .ok_or(RuntimeCheckErrorKind::CouldNotDetermineType)?;
 
     // Ensure that the expected type from the trait spec admits
     // the type of the value returned by the dynamic dispatch.
@@ -293,9 +275,7 @@ pub fn special_fetch_variable_v200(
 
     let var_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -303,17 +283,17 @@ pub fn special_fetch_variable_v200(
         .contract_context
         .meta_data_var
         .get(var_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such data variable: {var_name}"
         )))?;
 
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::FetchVar,
         exec_state,
-        data_types.value_type.size()?,
+        data_types.value_type.charged_size(&epoch)?,
     )?;
 
-    let epoch = *exec_state.epoch();
     exec_state
         .global_context
         .database
@@ -332,9 +312,7 @@ pub fn special_fetch_variable_v205(
 
     let var_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -342,7 +320,7 @@ pub fn special_fetch_variable_v205(
         .contract_context
         .meta_data_var
         .get(var_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such data variable: {var_name}"
         )))?;
 
@@ -354,7 +332,7 @@ pub fn special_fetch_variable_v205(
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => data_types.value_type.size()?.into(),
+        Err(_e) => data_types.value_type.charged_size(&epoch)?.into(),
     };
 
     runtime_cost(ClarityCostFunction::FetchVar, exec_state, result_size)?;
@@ -370,7 +348,7 @@ pub fn special_set_variable_v200(
 ) -> Result<Value, VmExecutionError> {
     if exec_state.global_context.is_read_only() {
         return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
+            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".into()).into(),
         );
     }
 
@@ -380,9 +358,7 @@ pub fn special_set_variable_v200(
 
     let var_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -390,20 +366,20 @@ pub fn special_set_variable_v200(
         .contract_context
         .meta_data_var
         .get(var_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such data variable: {var_name}"
         )))?;
 
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::SetVar,
         exec_state,
-        data_types.value_type.size()?,
+        data_types.value_type.charged_size(&epoch)?,
     )?;
 
-    exec_state.add_memory(value.as_ref().get_memory_use()?)?;
+    exec_state.add_memory(value.as_ref().get_memory_use(&epoch)?)?;
 
     let value = value.clone_with_cost(exec_state)?;
-    let epoch = *exec_state.epoch();
     exec_state
         .global_context
         .database
@@ -421,7 +397,7 @@ pub fn special_set_variable_v205(
 ) -> Result<Value, VmExecutionError> {
     if exec_state.global_context.is_read_only() {
         return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
+            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".into()).into(),
         );
     }
 
@@ -431,9 +407,7 @@ pub fn special_set_variable_v205(
 
     let var_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -441,7 +415,7 @@ pub fn special_set_variable_v205(
         .contract_context
         .meta_data_var
         .get(var_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such data variable: {var_name}"
         )))?;
 
@@ -454,7 +428,7 @@ pub fn special_set_variable_v205(
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => data_types.value_type.size()?.into(),
+        Err(_e) => data_types.value_type.charged_size(&epoch)?.into(),
     };
 
     runtime_cost(ClarityCostFunction::SetVar, exec_state, result_size)?;
@@ -474,9 +448,7 @@ pub fn special_fetch_entry_v200(
 
     let map_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let key = eval(&args[1], exec_state, invoke_ctx, context)?;
 
@@ -486,17 +458,18 @@ pub fn special_fetch_entry_v200(
         .contract_context
         .meta_data_map
         .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such map: {map_name}"
         )))?;
 
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::FetchEntry,
         exec_state,
-        data_types.value_type.size()? + data_types.key_type.size()?,
+        u64::from(data_types.value_type.charged_size(&epoch)?)
+            .cost_overflow_add(u64::from(data_types.key_type.charged_size(&epoch)?))?,
     )?;
 
-    let epoch = *exec_state.epoch();
     exec_state.global_context.database.fetch_entry(
         contract,
         map_name,
@@ -518,9 +491,7 @@ pub fn special_fetch_entry_v205(
 
     let map_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let key = eval(&args[1], exec_state, invoke_ctx, context)?;
 
@@ -530,7 +501,7 @@ pub fn special_fetch_entry_v205(
         .contract_context
         .meta_data_map
         .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such map: {map_name}"
         )))?;
 
@@ -545,7 +516,8 @@ pub fn special_fetch_entry_v205(
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => (data_types.value_type.size()? + data_types.key_type.size()?).into(),
+        Err(_e) => u64::from(data_types.value_type.charged_size(&epoch)?)
+            .cost_overflow_add(u64::from(data_types.key_type.charged_size(&epoch)?))?,
     };
 
     runtime_cost(ClarityCostFunction::FetchEntry, exec_state, result_size)?;
@@ -600,7 +572,7 @@ pub fn special_set_entry_v200(
 ) -> Result<Value, VmExecutionError> {
     if exec_state.global_context.is_read_only() {
         return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
+            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".into()).into(),
         );
     }
 
@@ -612,9 +584,7 @@ pub fn special_set_entry_v200(
 
     let map_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -622,22 +592,23 @@ pub fn special_set_entry_v200(
         .contract_context
         .meta_data_map
         .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such map: {map_name}"
         )))?;
 
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::SetEntry,
         exec_state,
-        data_types.value_type.size()? + data_types.key_type.size()?,
+        u64::from(data_types.value_type.charged_size(&epoch)?)
+            .cost_overflow_add(u64::from(data_types.key_type.charged_size(&epoch)?))?,
     )?;
 
-    exec_state.add_memory(key.as_ref().get_memory_use()?)?;
-    exec_state.add_memory(value.as_ref().get_memory_use()?)?;
+    exec_state.add_memory(key.as_ref().get_memory_use(&epoch)?)?;
+    exec_state.add_memory(value.as_ref().get_memory_use(&epoch)?)?;
 
     let key = key.clone_with_cost(exec_state)?;
     let value = value.clone_with_cost(exec_state)?;
-    let epoch = *exec_state.epoch();
     exec_state
         .global_context
         .database
@@ -655,7 +626,7 @@ pub fn special_set_entry_v205(
 ) -> Result<Value, VmExecutionError> {
     if exec_state.global_context.is_read_only() {
         return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
+            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".into()).into(),
         );
     }
 
@@ -667,9 +638,7 @@ pub fn special_set_entry_v205(
 
     let map_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -677,7 +646,7 @@ pub fn special_set_entry_v205(
         .contract_context
         .meta_data_map
         .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such map: {map_name}"
         )))?;
 
@@ -691,7 +660,8 @@ pub fn special_set_entry_v205(
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => (data_types.value_type.size()? + data_types.key_type.size()?).into(),
+        Err(_e) => u64::from(data_types.value_type.charged_size(&epoch)?)
+            .cost_overflow_add(u64::from(data_types.key_type.charged_size(&epoch)?))?,
     };
 
     runtime_cost(ClarityCostFunction::SetEntry, exec_state, result_size)?;
@@ -709,7 +679,7 @@ pub fn special_insert_entry_v200(
 ) -> Result<Value, VmExecutionError> {
     if exec_state.global_context.is_read_only() {
         return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
+            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".into()).into(),
         );
     }
 
@@ -721,9 +691,7 @@ pub fn special_insert_entry_v200(
 
     let map_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -731,20 +699,20 @@ pub fn special_insert_entry_v200(
         .contract_context
         .meta_data_map
         .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such map: {map_name}"
         )))?;
 
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::SetEntry,
         exec_state,
-        data_types.value_type.size()? + data_types.key_type.size()?,
+        u64::from(data_types.value_type.charged_size(&epoch)?)
+            .cost_overflow_add(u64::from(data_types.key_type.charged_size(&epoch)?))?,
     )?;
 
-    exec_state.add_memory(key.as_ref().get_memory_use()?)?;
-    exec_state.add_memory(value.as_ref().get_memory_use()?)?;
-
-    let epoch = *exec_state.epoch();
+    exec_state.add_memory(key.as_ref().get_memory_use(&epoch)?)?;
+    exec_state.add_memory(value.as_ref().get_memory_use(&epoch)?)?;
 
     let key = key.clone_with_cost(exec_state)?;
     let value = value.clone_with_cost(exec_state)?;
@@ -765,7 +733,7 @@ pub fn special_insert_entry_v205(
 ) -> Result<Value, VmExecutionError> {
     if exec_state.global_context.is_read_only() {
         return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
+            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".into()).into(),
         );
     }
 
@@ -777,9 +745,7 @@ pub fn special_insert_entry_v205(
 
     let map_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -787,7 +753,7 @@ pub fn special_insert_entry_v205(
         .contract_context
         .meta_data_map
         .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such map: {map_name}"
         )))?;
 
@@ -801,7 +767,8 @@ pub fn special_insert_entry_v205(
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => (data_types.value_type.size()? + data_types.key_type.size()?).into(),
+        Err(_e) => u64::from(data_types.value_type.charged_size(&epoch)?)
+            .cost_overflow_add(u64::from(data_types.key_type.charged_size(&epoch)?))?,
     };
 
     runtime_cost(ClarityCostFunction::SetEntry, exec_state, result_size)?;
@@ -819,7 +786,7 @@ pub fn special_delete_entry_v200(
 ) -> Result<Value, VmExecutionError> {
     if exec_state.global_context.is_read_only() {
         return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
+            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".into()).into(),
         );
     }
 
@@ -829,9 +796,7 @@ pub fn special_delete_entry_v200(
 
     let map_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -839,19 +804,19 @@ pub fn special_delete_entry_v200(
         .contract_context
         .meta_data_map
         .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such map: {map_name}"
         )))?;
 
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::SetEntry,
         exec_state,
-        data_types.key_type.size()?,
+        data_types.key_type.charged_size(&epoch)?,
     )?;
 
-    exec_state.add_memory(key.as_ref().get_memory_use()?)?;
+    exec_state.add_memory(key.as_ref().get_memory_use(&epoch)?)?;
 
-    let epoch = *exec_state.epoch();
     exec_state
         .global_context
         .database
@@ -869,7 +834,7 @@ pub fn special_delete_entry_v205(
 ) -> Result<Value, VmExecutionError> {
     if exec_state.global_context.is_read_only() {
         return Err(
-            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".to_string()).into(),
+            RuntimeCheckErrorKind::Unreachable("Write attempted in read-only".into()).into(),
         );
     }
 
@@ -879,9 +844,7 @@ pub fn special_delete_entry_v205(
 
     let map_name = args[0]
         .match_atom()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected name".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Expected name".into()))?;
 
     let contract = &invoke_ctx.contract_context.contract_identifier;
 
@@ -889,7 +852,7 @@ pub fn special_delete_entry_v205(
         .contract_context
         .meta_data_map
         .get(map_name)
-        .ok_or(RuntimeCheckErrorKind::Unreachable(format!(
+        .ok_or(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such map: {map_name}"
         )))?;
 
@@ -904,7 +867,7 @@ pub fn special_delete_entry_v205(
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => data_types.key_type.size()?.into(),
+        Err(_e) => data_types.key_type.charged_size(&epoch)?.into(),
     };
 
     runtime_cost(ClarityCostFunction::SetEntry, exec_state, result_size)?;
@@ -949,14 +912,14 @@ pub fn special_get_block_info(
     let property_name = args[0]
         .match_atom()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Get block info expect property name".to_string(),
+            "Get block info expect property name".into(),
         ))?;
 
     let version = invoke_ctx.contract_context.get_clarity_version();
 
     let block_info_prop = BlockInfoProperty::lookup_by_name_at_version(property_name, version)
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Get block info expect property name".to_string(),
+            "Get block info expect property name".into(),
         ))?;
 
     // Handle the block-height input arg clause.
@@ -1114,11 +1077,11 @@ pub fn special_get_burn_block_info(
     let property_name = args[0]
         .match_atom()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Get block info expect property name".to_string(),
+            "Get block info expect property name".into(),
         ))?;
 
     let block_info_prop = BurnBlockInfoProperty::lookup_by_name(property_name).ok_or(
-        RuntimeCheckErrorKind::Unreachable(format!(
+        RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such burn block info property: {property_name}"
         )),
     )?;
@@ -1223,11 +1186,11 @@ pub fn special_get_stacks_block_info(
     let property_name = args[0]
         .match_atom()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Get stacks block info expect property name".to_string(),
+            "Get stacks block info expect property name".into(),
         ))?;
 
     let block_info_prop = StacksBlockInfoProperty::lookup_by_name(property_name).ok_or(
-        RuntimeCheckErrorKind::Unreachable(format!(
+        RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "No such stacks block info property: {property_name}"
         )),
     )?;
@@ -1318,11 +1281,11 @@ pub fn special_get_tenure_info(
     let property_name = args[0]
         .match_atom()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Get tenure info expect property name".to_string(),
+            "Get tenure info expect property name".into(),
         ))?;
 
     let block_info_prop = TenureInfoProperty::lookup_by_name(property_name).ok_or(
-        RuntimeCheckErrorKind::Unreachable("Get tenure info expect property name".to_string()),
+        RuntimeCheckErrorKind::Unreachable("Get tenure info expect property name".into()),
     )?;
 
     // Handle the block-height input arg.

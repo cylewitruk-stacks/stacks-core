@@ -55,14 +55,19 @@ SignerAgreementStateConflict {
 pub mod actions {
     use ::prometheus::HistogramTimer;
     use blockstack_lib::chainstate::nakamoto::NakamotoBlock;
+    use libsigner::v0::signer_state::MinerState;
     use stacks_common::error;
+    use stacks_network::DeferredMinerAuthorizationSnapshot;
 
     use crate::config::GlobalConfig;
     use crate::monitoring::prometheus::*;
     use crate::monitoring::{SignerAgreementStateChangeReason, SignerAgreementStateConflict};
     use crate::v0::signer_state::LocalStateMachine;
-    use libsigner::v0::signer_state::MinerState;
-    use stacks_network::DeferredMinerAuthorizationSnapshot;
+
+    /// Record the process build information. Repeated calls keep the same series at 1.
+    pub fn record_build_info() {
+        BUILD_INFO.set(1);
+    }
 
     /// Update stacks tip height gauge
     pub fn update_stacks_tip_height(height: i64) {
@@ -144,14 +149,14 @@ pub mod actions {
         let diff =
             get_epoch_time_ms().saturating_sub(block.header.timestamp.saturating_mul(1000).into());
         SIGNER_BLOCK_RESPONSE_LATENCIES_HISTOGRAM
-            .with_label_values(&[])
+            .with_label_values::<&str>(&[])
             .observe(diff as f64 / 1000.0);
     }
 
     /// Record the time taken to validate a block, as reported by the Stacks node.
     pub fn record_block_validation_latency(latency_ms: u64) {
         SIGNER_BLOCK_VALIDATION_LATENCIES_HISTOGRAM
-            .with_label_values(&[])
+            .with_label_values::<&str>(&[])
             .observe(latency_ms as f64 / 1000.0);
     }
 
@@ -266,12 +271,11 @@ pub mod actions {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let delta = |current: u64, previous: u64| {
-            let value = if current >= previous {
+            if current >= previous {
                 current - previous
             } else {
                 current
-            };
-            i64::try_from(value).unwrap_or(i64::MAX)
+            }
         };
         let admitted_delta = delta(deferred.admitted, prior.admitted);
         DEFERRED_MINER_AUTHORIZATIONS_ADMITTED.inc_by(admitted_delta);
@@ -315,7 +319,7 @@ pub mod actions {
     }
 
     #[cfg(test)]
-    pub(crate) fn deferred_miner_authorizations_admitted_for_test() -> i64 {
+    pub(crate) fn deferred_miner_authorizations_admitted_for_test() -> u64 {
         DEFERRED_MINER_AUTHORIZATIONS_ADMITTED.get()
     }
 
@@ -347,7 +351,7 @@ pub mod actions {
     /// Record the time (seconds) taken for a signer to agree with the signer set
     pub fn record_signer_agreement_capitulation_latency(latency_s: u64) {
         SIGNER_AGREEMENT_CAPITULATION_LATENCIES_HISTOGRAM
-            .with_label_values(&[])
+            .with_label_values::<&str>(&[])
             .observe(latency_s as f64);
     }
 
@@ -357,6 +361,7 @@ pub mod actions {
         if config.metrics_endpoint.is_none() {
             return Ok(());
         }
+        record_build_info();
         let _ = std::thread::Builder::new()
             .name("signer_metrics".to_string())
             .spawn(move || {
@@ -373,11 +378,14 @@ pub mod actions {
 pub mod actions {
     use blockstack_lib::chainstate::nakamoto::NakamotoBlock;
     use stacks_common::info;
+    use stacks_network::DeferredMinerAuthorizationSnapshot;
 
     use crate::monitoring::{SignerAgreementStateChangeReason, SignerAgreementStateConflict};
     use crate::v0::signer_state::LocalStateMachine;
     use crate::GlobalConfig;
-    use stacks_network::DeferredMinerAuthorizationSnapshot;
+
+    /// No-op when Prometheus monitoring is disabled.
+    pub fn record_build_info() {}
 
     /// Update stacks tip height gauge
     pub fn update_stacks_tip_height(_height: i64) {}

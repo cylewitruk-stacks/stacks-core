@@ -22,13 +22,26 @@ use clarity::vm::{ClarityName, Value};
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::Address;
 
-use super::test_rpc;
+use super::{bool_list_hex, test_rpc};
 use crate::net::api::*;
 use crate::net::connection::ConnectionOptions;
+use crate::net::http::HttpRequestContents;
 use crate::net::httpcore::{
     HttpRequestContentsExtensions as _, RPCRequestHandler, StacksHttp, StacksHttpRequest,
 };
 use crate::net::{ProtocolFamily, TipRequest};
+
+fn new_getmapentry_request_with_hex_key(addr: SocketAddr, key: String) -> StacksHttpRequest {
+    let contract_addr =
+        StacksAddress::from_string("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R").unwrap();
+    StacksHttpRequest::new_for_peer(
+        addr.into(),
+        "POST".into(),
+        format!("/v2/map_entry/{contract_addr}/flood/m"),
+        HttpRequestContents::new().payload_json(serde_json::Value::String(key)),
+    )
+    .unwrap()
+}
 
 #[test]
 fn test_try_parse_request() {
@@ -55,7 +68,9 @@ fn test_try_parse_request() {
     debug!("Request:\n{}\n", std::str::from_utf8(&bytes).unwrap());
 
     let (parsed_preamble, offset) = http.read_preamble(&bytes).unwrap();
-    let mut handler = getmapentry::RPCGetMapEntryRequestHandler::new();
+    let mut handler = getmapentry::RPCGetMapEntryRequestHandler::new(
+        ConnectionOptions::default().read_only_call_max_mem_bytes,
+    );
     let mut parsed_request = http
         .handle_try_parse_request(
             &mut handler,
@@ -92,19 +107,72 @@ fn test_try_parse_request() {
     assert!(handler.key.is_none());
 }
 
+/// Rejected by the body wire-size preflight, before JSON parsing.
+#[test]
+fn test_try_parse_request_rejects_oversized_key() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
+    let mut http = StacksHttp::new(addr, &ConnectionOptions::default());
+    // ~4 KiB hex body against a 1 KiB limit.
+    let request = new_getmapentry_request_with_hex_key(addr, bool_list_hex(2048));
+    let bytes = request.try_serialize().unwrap();
+
+    let (parsed_preamble, offset) = http.read_preamble(&bytes).unwrap();
+    let mut handler = getmapentry::RPCGetMapEntryRequestHandler::new(1024);
+
+    let error = format!(
+        "{:?}",
+        http.handle_try_parse_request(
+            &mut handler,
+            &parsed_preamble.expect_request(),
+            &bytes[offset..],
+        )
+        .unwrap_err()
+    );
+    assert!(
+        error.contains("exceeds parse memory limit"),
+        "unexpected error: {error}"
+    );
+    assert!(handler.key.is_none());
+}
+
 #[test]
 fn test_try_make_response() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
 
     let mut requests = vec![];
 
-    // query existing
+    // Proofs are returned unless the client opts out.
+    let request = StacksHttpRequest::new_for_peer(
+        addr.into(),
+        "POST".into(),
+        "/v2/map_entry/ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R/hello-world/test-map".into(),
+        HttpRequestContents::new()
+            .for_tip(TipRequest::UseLatestAnchoredTip)
+            .payload_json(serde_json::Value::String(
+                Value::UInt(1).serialize_to_hex().unwrap(),
+            )),
+    )
+    .unwrap();
+    requests.push(request);
+
     let request = StacksHttpRequest::new_getmapentry(
         addr.into(),
         StacksAddress::from_string("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R").unwrap(),
         "hello-world".try_into().unwrap(),
         "test-map".try_into().unwrap(),
         Value::UInt(1),
+        TipRequest::UseLatestAnchoredTip,
+        false,
+    );
+    requests.push(request);
+
+    // A missing key must not be confused with a missing map.
+    let request = StacksHttpRequest::new_getmapentry(
+        addr.into(),
+        StacksAddress::from_string("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R").unwrap(),
+        "hello-world".try_into().unwrap(),
+        "test-map".try_into().unwrap(),
+        Value::UInt(100),
         TipRequest::UseLatestAnchoredTip,
         true,
     );
@@ -179,6 +247,21 @@ fn test_try_make_response() {
     let resp = response.decode_map_entry_response().unwrap();
     assert_eq!(resp.data, "0x0a0100000000000000000000000000000002");
     assert!(resp.marf_proof.is_some());
+
+    let response = responses.remove(0);
+    debug!(
+        "Response:\n{}\n",
+        std::str::from_utf8(&response.try_serialize().unwrap()).unwrap()
+    );
+
+    let resp = response.decode_map_entry_response().unwrap();
+    assert_eq!(resp.data, "0x0a0100000000000000000000000000000002");
+    assert!(resp.marf_proof.is_none());
+
+    let response = responses.remove(0);
+    let resp = response.decode_map_entry_response().unwrap();
+    assert_eq!(resp.data, "0x09");
+    assert_eq!(resp.marf_proof, Some("".to_string()));
 
     // unconfirmed data
     let response = responses.remove(0);
